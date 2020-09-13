@@ -1,0 +1,2031 @@
+---
+title: "Somitogenesis investigation"
+author: "C. Guibentif, J. Griffiths et al. Chimera"
+output:
+  BiocStyle::html_document:
+    code_folding: hide
+    number_sections: yes
+    toc: yes  
+    titlecaps: true
+---
+
+
+```{r load-atlas, message = FALSE, warning = FALSE}
+library(Matrix)
+library(scran)
+library(Rtsne)
+library(irlba)
+library(igraph)
+library(reshape2)
+library(scales)
+library(ggrepel)
+library(destiny)
+library(scater)
+library(matrixStats)
+library(biomaRt)
+library(pheatmap)
+library(BiocNeighbors)
+library(cowplot)
+library(dynamicTreeCut)
+
+library(knitr)
+knitr::opts_chunk$set(cache=TRUE, warning = FALSE, 
+                      message = FALSE, cache.lazy = FALSE)
+
+#set it up for scran to be properly parallelised
+library(BiocParallel)
+ncores = 1
+mcparam = MulticoreParam(workers = ncores)
+register(mcparam)
+
+
+# ATLAS
+source("/nfs/research1/marioni/jonny/embryos/scripts/core_functions.R")
+load_data(remove_doublets = TRUE, remove_stripped = TRUE, load_corrected = TRUE)
+
+full_meta = meta
+full_sce = sce
+meta = meta[meta$stage != "mixed_gastrulation", ]
+meta = meta[!meta$celltype %in% c("ExE ectoderm", "ExE endoderm", "Parietal endoderm"),]
+sce = scater::normalize(sce[ ,meta$cell])
+
+```
+
+# Identifying cells in trajectories
+
+For the somitogenesis trajectories, we have used Waddington-OT to identify cells.
+
+First, cells in the somitic mesoderm and paraxial mesoderm of the atlas (Pijuan-Sala et al. 2019) were analysed, subclustered, and annotated.
+Waddington-OT was then run using the celltypes from Pijuan-Sala et al., with the replacement of the paraxial/somitic mesoderm clusters of the dataset by the appropriate subclusters.
+This was performed in a separate script by a separate author.
+
+To classify cells into trajectories, we applied a similar method as in the endoderm analysis of Pijuan-Sala et al. (2019).
+That is, for a trajectory, we considered cells to belong to it when the cells' mass contribution to that trajectory was greater than any other, or when it was at least 90% as high as the highest value (this is to identify uncommitted cells where the evidence does not indicate strongly one fate or another).
+The trajectory data is loaded and tidied in the next chunk of code.
+
+```{r}
+annot_post = read.table("/nfs/research1/marioni/jonny/chimera-t/scripts/somitogenesis/data/somiticmeso_e85_annotation.txt", header = TRUE, stringsAsFactors = FALSE)
+annot_ant = read.table("/nfs/research1/marioni/jonny/chimera-t/scripts/somitogenesis/data/paraxialmeso_e85_annotation.txt", header = TRUE, stringsAsFactors = FALSE)
+
+masses = read.table("/nfs/research1/marioni/jonny/chimera-t/scripts/somitogenesis/data/corrected/E85_all_trajectories.txt", sep = "\t", header = TRUE, row.names = 1)
+masses = masses[, -which(grepl("id.[0-9]", colnames(masses)))]
+masses = masses[, !names(masses) %in% c("Paraxial.mesoderm", "Somitic.mesoderm")]
+masses = as.matrix(masses)
+post_ratio = masses[,"Posterior.most_somites"]/rowMax(masses)
+ant_ratio = masses[,"Anterior.most_somites"]/rowMax(masses)
+nmp_ratio = masses[,"NMP"]/rowMax(masses)
+cm_ratio = masses[,"Caudal.Mesoderm"]/rowMax(masses)
+sc_ratio = masses[,"Spinal.cord"]/rowMax(masses)
+
+meta$post_ratio = post_ratio[match(meta$cell, names(post_ratio))]
+meta$ant_ratio = ant_ratio[match(meta$cell, names(ant_ratio))]
+meta$nmp_ratio = nmp_ratio[match(meta$cell, names(nmp_ratio))]
+meta$cm_ratio = cm_ratio[match(meta$cell, names(cm_ratio))]
+meta$sc_ratio = sc_ratio[match(meta$cell, names(sc_ratio))]
+
+meta$traj_post = meta$post_ratio > 0.9 |
+  meta$cell %in% annot_post$cell[annot_post$celltype == "Posterior-most_somites"]
+meta$traj_ant = meta$ant_ratio > 0.9 | 
+  meta$cell %in% annot_ant$cell[annot_ant$celltype == "Anterior-most_somites"]
+meta$traj_nmp = meta$nmp_ratio > 0.9 | 
+  (meta$celltype == "NMP" & meta$stage == "E8.5")
+meta$traj_cm = meta$cm_ratio > 0.9 | 
+  (meta$celltype == "Caudal Mesoderm" & meta$stage == "E8.5")
+meta$traj_sc = meta$sc_ratio > 0.9 | 
+  (meta$celltype == "Spinal cord" & meta$stage == "E8.5")
+
+sce_ant = scater::normalize(sce[, meta$traj_ant])
+meta_ant = meta[meta$traj_ant, ]
+sce_post = scater::normalize(sce[, meta$traj_post])
+meta_post = meta[meta$traj_post, ]
+sce_nmp = scater::normalize(sce[, meta$traj_nmp])
+meta_nmp = meta[meta$traj_nmp, ]
+
+meta_cm = meta[meta$traj_cm,]
+meta_sc = meta[meta$traj_sc,]
+
+mmb = data.frame(
+  cell = c(meta_ant$cell, meta_post$cell, meta_nmp$cell),
+  traj = c(rep("ant", nrow(meta_ant)), rep("post", nrow(meta_post)), rep("nmp", nrow(meta_nmp)))
+  )
+
+write.table(mmb, "/nfs/research1/marioni/jonny/chimera-t/scripts/somitogenesis/trajectory_membership.tab", row.names = FALSE, col.names = TRUE, sep = "\t")
+
+save(sce_post, sce_ant, meta_post, meta_ant, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/somitogenesis/sces_traj.RData") #for debugging
+```
+
+One question we might have for this data is how the atlas cells fall between different trajectories, and how cells might overlap between them.
+Table \@ref(tab:shared) shows the number of cells that are shared for different combinations of trajectories.
+
+```{r shared}
+combs = combn(colnames(meta)[grepl("traj", colnames(meta))], 2)
+shared = apply(combs, 2, function(x) sum(meta[, x[1]] & meta[, x[2]]))
+names(shared) = apply(combs, 2, function(x) 
+  paste(
+    gsub("traj_", "", x[1]), 
+    gsub("traj_", "", x[2]), 
+    sep = "-"))
+code = c(
+  "post"="Post. meso",
+  "ant"="Ant. meso",
+  "cm"="Caudal meso",
+  "nmp"="NMP",
+  "sc"="Spinal cord"
+)
+names(shared) = sapply(names(shared), function(x){
+  for(i in seq_along(code)){
+    x = gsub(names(code)[i], code[i], x)
+  }
+  return(x)
+})
+kable(shared, col.names = "Number of shared cells", caption = "Total number of cells overlapping trajectories")
+```
+
+Focussing on the anterior/posterior somitic trajectories, what level of overlap do we see along timepoints?
+This is shown in Table \@ref(tab:ant-post-overlap).
+
+```{r ant-post-overlap}
+sub = mmb[mmb$traj %in% c("ant", "post"),]
+sub$stage = meta$stage[match(sub$cell, meta$cell)]
+tabs = lapply(unique(meta$stage), function(x) table(table(as.character(sub$cell[sub$stage == x]))))
+for(i in seq_along(tabs)){
+  if(length(tabs[[i]]) == 1){
+    tabs[[i]] = c(tabs[[i]], c("2" = 0))
+  }
+}
+
+names(tabs) = unique(meta$stage)
+tab = as.data.frame(do.call(rbind, tabs))
+tab = tab[order(rownames(tab)),]
+colnames(tab) = c("One traj.", "Both traj.")
+tab[, "% both"] = tab[,2]/rowSums(tab) * 100
+kable(tab, caption = "Overlap of cells between anterior and posterior trajectory presence.")
+```
+
+## NMP mass over Anterior and Posterior trajectories
+
+Do we see much sharing of mass between cells allocated to anterior or posterior somitic mesoderm trajectories, and the NMP trajectories?
+The fraction of cells' total mass for the NMP trajectory is shown for each of these in Figure \@ref(fig:ant-post-nmp-mass).
+
+```{r ant-post-nmp-mass, fig.cap = "Fraction of total mass provided by the NMP trajectory for cells in the Anterior or posterior trajectories."}
+nmp_frac = masses[,"NMP"]/rowSums(masses)
+meta$nmp_frac = nmp_frac[match(meta$cell, names(nmp_frac))]
+my_cols = c("FALSE" = "purple", "TRUE" = "seagreen4")
+
+t.tests = lapply(unique(meta$stage), function(x){
+  t.test(meta$nmp_frac[meta$traj_post & meta$stage == x], 
+    meta$nmp_frac[meta$traj_ant & meta$stage == x])
+})
+pvals = sapply(t.tests, function(x) x$p.value)
+# p.adjust(pvals, method = "fdr")
+
+p = ggplot(meta[which(meta$traj_ant | meta$traj_post),],
+        aes(x = stage, y = nmp_frac, fill = traj_post)) +
+    geom_boxplot(alpha = 0.7) +
+    scale_fill_manual(values = my_cols, labels = c("FALSE" = "Anterior", "TRUE" = "Posterior"), name = "Trajectory") +
+    labs(y = "Fraction NMP mass") +
+    theme(axis.text.x = element_text(angle = 45, hjust=1,vjust=1),
+      axis.title.x = element_blank())
+
+ggsave(p, file = "plots/nmp_mass_along_traj.pdf", width = 5, height = 3)
+p
+
+means = sapply(c("traj_post", "traj_ant"), function(traj){
+  sapply(unique(meta$stage), function(stage){
+    allowed = which(meta[, traj] & meta$stage == stage)
+    mean(meta$nmp_frac[allowed], na.rm = TRUE)
+  })
+})
+means = means[rownames(means) != "E8.5",]
+means = means[order(rownames(means)),]
+
+sds = sapply(c("traj_post", "traj_ant"), function(traj){
+  sapply(unique(meta$stage), function(stage){
+    allowed = which(meta[, traj] & meta$stage == stage)
+    sd(meta$nmp_frac[allowed], na.rm = TRUE)
+  })
+})
+sds = sds[rownames(sds) != "E8.5",]
+sds = sds[order(rownames(sds)),]
+
+mlt = melt(means)
+names(mlt) = c("stage", "traj", "mean")
+mlt$sd = sapply(seq_len(nrow(mlt)), function(x){
+  sds[mlt$stage[x], mlt$traj[x]]
+})
+
+p = ggplot(mlt, aes(x = stage, col = traj, group = traj)) +
+    geom_line(aes(y = mean)) +
+    geom_point(aes(y = mean)) +
+    geom_errorbar(aes(ymin = mean - sd/2, ymax = mean + sd/2), width = 0.2) +
+    theme_cowplot() +
+    scale_colour_manual(values = c(traj_post = "#e2c207", traj_ant = "coral"),
+                        labels = c(traj_post = "Post.", traj_ant = "Ant."),
+                        name = "") +
+    labs(y = "NMP mass fraction") +
+    theme(axis.title.x = element_blank(), axis.text.x = element_text(angle = 30, hjust = 1))
+
+p
+ggsave(p, file = "plots/nmp_mass_along_traj_means.pdf", width = 4, height = 3)
+```
+
+## DE at all timepoints in the somite trajectories
+
+In the next chunk, we identify differentially expressed genes between the anterior and posterior trajectories.
+We use `scran::findMarkers` to do this, and do so separately for each timepoint in the atlas.
+
+```{r}
+# be in either trajectory, not both, and E7.5
+tps = unique(meta$stage[meta$stage != "mixed_gastrulation"])
+for(tp in tps){
+  keeps = (meta$traj_post | meta$traj_ant) & !(meta$traj_post & meta$traj_ant) & meta$stage == tp
+  sub_sce = scater::normalize(sce[, keeps])
+  sub_meta = meta[keeps, ]
+  sub_meta$label = ifelse(sub_meta$traj_post, "post", "ant")
+
+  de = findMarkers(sub_sce, clusters = sub_meta$label)
+  de[[1]]$mgi = get_mgi(rownames(de[[1]]))
+  write.table(de[[1]], file = paste0(
+    "de_along/de_", 
+    tp, 
+    "_atlas_anteriorsom_vs_posteriorsom.csv"), 
+    sep = "\t", row.names = TRUE, col.names = TRUE, quote = FALSE)
+}
+```
+
+## DE at all timepoints in the NMP trajectories
+
+We now repeat the same procedure, except including the NMP cells, and save the set of DE genes for the NMPs compared to anterior or posterior mesoderm trajectory cells.
+
+```{r}
+# be in either trajectory, not both, and E7.5
+tps = unique(meta$stage[meta$stage != "mixed_gastrulation"])
+for(tp in tps){
+  keeps = (meta$traj_post | meta$traj_ant | meta$traj_nmp) & 
+  !(meta$traj_post & meta$traj_ant) &
+  !(meta$traj_post & meta$traj_nmp) &
+  !(meta$traj_nmp & meta$traj_ant) &
+  !(meta$traj_post & meta$traj_ant & meta$traj_nmp) &
+  meta$stage == tp
+  sub_sce = scater::normalize(sce[, keeps])
+  sub_meta = meta[keeps, ]
+  sub_meta$label = ifelse(sub_meta$traj_post, 
+    "post", 
+    ifelse(sub_meta$traj_ant,
+      "ant", 
+      "nmp")
+  )
+
+  de = findMarkers(sub_sce, clusters = sub_meta$label, pval.type = "any")
+  de[["nmp"]]$mgi = get_mgi(rownames(de[["nmp"]]))
+  write.table(de[["nmp"]], file = paste0(
+    "de_along/de_", 
+    tp, 
+    "_atlas_nmp_vs_som.csv"), 
+    sep = "\t", row.names = TRUE, col.names = TRUE, quote = FALSE)
+}
+```
+
+## UMAP plots
+
+We show the cells that were assigned to different trajectories in the UMAP plots below.
+These UMAPs are the same as were used in Pijuan-Sala et al. (2019).
+
+First, we plot the cells in each trajectory with the colour of the celltype that each cell was allocated.
+This is shown in Figure \@ref(fig:umap-ct-colour).
+
+```{r umap-ct-colour, fig.wide = FALSE, fig.height = 12, fig.cap = "Cells in each of the anterior and posterior trajectories are shown, and coloured according to their celltype label."}
+
+umap = read.table("/nfs/research1/marioni/jonny/embryos/scripts/vis/umap/umap.tab")
+rownames(umap) = rownames(corrected$all)
+
+p1 = ggplot() +
+  geom_point(mapping = aes(
+    x = umap[-which(rownames(umap) %in% meta_ant$cell), 1], 
+    y = umap[-which(rownames(umap) %in% meta_ant$cell), 2]),
+  col = "lightgrey",
+  size = 0.4) +
+  geom_point(mapping = aes(
+    x = umap[meta_ant$cell, 1], 
+    y = umap[meta_ant$cell, 2],
+    fill = meta_ant$celltype),
+  pch = 21,
+  col = "black",
+  size = 1) +
+  scale_fill_manual(values = celltype_colours) +
+  theme(legend.position = "none",
+    axis.text = element_blank(),
+    axis.ticks = element_blank()) +
+  ggtitle("Anterior somites") +
+  labs(x = "UMAP1", y = "UMAP2")
+
+p2 = ggplot() +
+  geom_point(mapping = aes(
+    x = umap[-which(rownames(umap) %in% meta_post$cell), 1], 
+    y = umap[-which(rownames(umap) %in% meta_post$cell), 2]),
+  col = "lightgrey",
+  size = 0.4) +
+  geom_point(mapping = aes(
+    x = umap[meta_post$cell, 1], 
+    y = umap[meta_post$cell, 2],
+    fill = meta_post$celltype),
+  pch = 21,
+  col = "black",
+  size = 1) +
+  scale_fill_manual(values = celltype_colours) +
+  theme(legend.position = "none",
+    axis.text = element_blank(),
+    axis.ticks = element_blank()) +
+  ggtitle("Posterior somites") +
+  labs(x = "UMAP1", y = "UMAP2")
+
+grid = plot_grid(p1, p2, ncol = 1)
+grid
+ggsave(grid, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/somitogenesis/plots/trajectory_umap_twopanel.pdf",
+	width = 4, height = 8)
+
+```
+
+Next, we plot the two trajectories together, and highlight the shared cells, in Figure \@ref(fig:shared-orange).
+
+```{r shared-orange, fig.cap = "Cells in anterior and posterior somite trajectories are shown. Shared cells are coloured orange."}
+
+status = sapply(rownames(umap), function(x){
+	if(x %in% meta_ant$cell & x %in% meta_post$cell){
+		return("Both")
+	} else if (x %in% meta_ant$cell){
+		return("Anterior")
+	} else if (x %in% meta_post$cell){
+		return("Posterior")
+	} else {
+		return("None")
+	}
+})
+status = factor(status, levels = c("None", "Anterior", "Posterior", "Both"), ordered = TRUE)
+umap = umap[order(status),]
+status = status[order(status)]
+p=ggplot(data = umap) +
+  geom_point(mapping = aes(
+    x = V1, 
+    y = V2,
+    fill = status),
+  pch = ifelse(status != "None", 21, 1),
+  col = ifelse(status != "None", "black", "lightgrey"),
+  size = ifelse(status != "None", 1, 0.4)) +
+  scale_fill_manual(values = c(
+  	"Anterior" = as.character(celltype_colours["Paraxial mesoderm"]),
+  	"Posterior" = as.character(celltype_colours["Somitic mesoderm"]),
+  	"Both" = "orange",
+  	"Neither" = "lightgrey")) +
+  theme(legend.position = "none",
+    axis.text = element_blank(),
+    axis.ticks = element_blank()) +
+  labs(x = "UMAP1", y = "UMAP2")
+
+p
+ggsave(p, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/somitogenesis/plots/trajectory_umap_combined.pdf",
+	width = 4, height = 4)
+
+```
+
+The same plot is produced in Figure \@ref(fig:ant-post-timepoint), except coloured by the timepoint from which the cells were sampled.
+
+```{r ant-post-timepoint, fig.cap = "Anterior and posterior mesoderm trajectories are shown, coloured by the timepoint from which the cells were sampled."}
+
+status = sapply(rownames(umap), function(x){
+	if(x %in% meta_ant$cell & x %in% meta_post$cell){
+		return("Both")
+	} else if (x %in% meta_ant$cell){
+		return("Anterior")
+	} else if (x %in% meta_post$cell){
+		return("Posterior")
+	} else {
+		return("None")
+	}
+})
+status = factor(status, levels = c("None", "Anterior", "Posterior", "Both"), ordered = TRUE)
+umap = umap[order(status),]
+stage = meta$stage[match(rownames(umap), meta$cell)]
+status = status[order(status)]
+p = ggplot(data = umap) +
+  geom_point(mapping = aes(
+    x = V1, 
+    y = V2,
+    fill = stage),
+  pch = ifelse(status != "None", 21, 1),
+  col = ifelse(status != "None", "black", "lightgrey"),
+  size = ifelse(status != "None", 1, 0.4)) +
+  scale_fill_manual(values = stage_colours) +
+  theme(legend.position = "none",
+    axis.text = element_blank(),
+    axis.ticks = element_blank()) +
+  labs(x = "UMAP1", y = "UMAP2")
+
+p
+ggsave(p, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/somitogenesis/plots/trajectory_umap_stagecolour.pdf",
+	width = 4, height = 4)
+
+ct = meta$celltype[match(rownames(umap), meta$cell)]
+p = ggplot(data = umap) +
+  geom_point(mapping = aes(
+    x = V1, 
+    y = V2,
+    fill = ct),
+  pch = ifelse(status != "None", 21, 1),
+  col = ifelse(status != "None", "black", "lightgrey"),
+  size = ifelse(status != "None", 1, 0.4)) +
+  scale_fill_manual(values = celltype_colours) +
+  theme(legend.position = "none",
+    axis.text = element_blank(),
+    axis.ticks = element_blank()) +
+  labs(x = "UMAP1", y = "UMAP2")
+
+p
+ggsave(p, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/somitogenesis/plots/trajectory_umap_celltypecolour.pdf",
+  width = 4, height = 4)
+
+
+umap = umap[order(status == "Anterior"),]
+stage = meta$stage[match(rownames(umap), meta$cell)]
+status = status[order(status == "Anterior")]
+p = ggplot(data = umap) +
+  geom_point(mapping = aes(
+    x = V1, 
+    y = V2,
+    fill = stage),
+  pch = ifelse(status == "Anterior", 21, 1),
+  col = ifelse(status == "Anterior", "black", "lightgrey"),
+  size = ifelse(status == "Anterior", 1, 0.4)) +
+  scale_fill_manual(values = stage_colours) +
+  theme(legend.position = "none",
+    axis.text = element_blank(),
+    axis.ticks = element_blank()) +
+  labs(x = "UMAP1", y = "UMAP2")
+ggsave(p, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/somitogenesis/plots/trajectory_umap_stagecolour_ant.pdf",
+  width = 4, height = 4)
+
+umap = umap[order(status == "Posterior"),]
+stage = meta$stage[match(rownames(umap), meta$cell)]
+status = status[order(status == "Posterior")]
+p = ggplot(data = umap) +
+  geom_point(mapping = aes(
+    x = V1, 
+    y = V2,
+    fill = stage),
+  pch = ifelse(status == "Posterior", 21, 1),
+  col = ifelse(status == "Posterior", "black", "lightgrey"),
+  size = ifelse(status == "Posterior", 1, 0.4)) +
+  scale_fill_manual(values = stage_colours) +
+  theme(legend.position = "none",
+    axis.text = element_blank(),
+    axis.ticks = element_blank()) +
+  labs(x = "UMAP1", y = "UMAP2")
+
+ggsave(p, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/somitogenesis/plots/trajectory_umap_stagecolour_post.pdf",
+  width = 4, height = 4)
+
+```
+
+Cells in the NMP trajectory are also shown in Figure \@ref(fig:add-nmp).
+
+```{r add-nmp, fig.cap = "Cells in trajectories are shown, including the NMP trajectory."}
+
+status = sapply(rownames(umap), function(x){
+  if(x %in% meta_ant$cell & x %in% meta_post$cell){
+    return("Ant/Post")
+  } else if(x %in% meta_nmp$cell & x %in% meta_post$cell){
+    return("Post/NMP")
+  } else if (x %in% meta_ant$cell){
+    return("Anterior")
+  } else if (x %in% meta_post$cell){
+    return("Posterior")
+  } else if (x %in% meta_nmp$cell){
+    return("NMP")
+  } else {
+    return("None")
+  }
+})
+status = factor(status, levels = c("None", "Anterior", "Posterior", "NMP","Ant/Post", "Post/NMP"), ordered = TRUE)
+umap = umap[order(status),]
+status = status[order(status)]
+
+ct = meta$celltype[match(rownames(umap), meta$cell)]
+p = ggplot(data = umap) +
+  geom_point(mapping = aes(
+    x = V1, 
+    y = V2,
+    fill = ct),
+  pch = ifelse(status != "None", 21, 1),
+  col = ifelse(status != "None", "black", "lightgrey"),
+  size = ifelse(status != "None", 1, 0.4)) +
+  scale_fill_manual(values = celltype_colours) +
+  theme(legend.position = "none",
+    axis.text = element_blank(),
+    axis.ticks = element_blank()) +
+  labs(x = "UMAP1", y = "UMAP2")
+
+p
+
+ggsave(p, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/somitogenesis/plots/triple_trajectory_umap_celltypecolour.pdf",
+  width = 4, height = 4)
+
+stage = meta$stage[match(rownames(umap), meta$cell)]
+p = ggplot(data = umap) +
+  geom_point(mapping = aes(
+    x = V1, 
+    y = V2,
+    fill = stage),
+  pch = ifelse(status != "None", 21, 1),
+  col = ifelse(status != "None", "black", "lightgrey"),
+  size = ifelse(status != "None", 1, 0.4)) +
+  scale_fill_manual(values = stage_colours) +
+  theme(#legend.position = "none",
+    axis.text = element_blank(),
+    axis.ticks = element_blank()) +
+  labs(x = "UMAP1", y = "UMAP2") +
+  guides(fill = guide_legend(override.aes = list(size = 5, pch = 21)))
+
+p
+
+ggsave(p, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/somitogenesis/plots/triple_trajectory_umap_stagecolour.pdf",
+  width = 4, height = 4)
+
+```
+
+```{r}
+
+status = sapply(rownames(umap), function(x){
+	if(x %in% meta_ant$cell & x %in% meta_post$cell){
+		return("Ant/Post")
+	} else if(x %in% meta_cm$cell & x %in% meta_post$cell){
+    return("Post/CM")
+  } else if(x %in% meta_cm$cell & x %in% meta_nmp$cell){
+    return("CM/NMP")
+  } else if (x %in% meta_ant$cell){
+		return("Anterior")
+	} else if (x %in% meta_post$cell){
+		return("Posterior")
+	} else if (x %in% meta_nmp$cell){
+		return("NMP")
+	} else if (x %in% meta_cm$cell){
+    return("CM")
+  } else {
+		return("None")
+	}
+})
+status = factor(status, levels = c("None", "Anterior", "Posterior", "NMP", "CM", "Ant/Post", "CM/NMP", "Post/CM"), ordered = TRUE)
+umap = umap[order(status),]
+status = status[order(status)]
+p = ggplot(data = umap) +
+  geom_point(mapping = aes(
+    x = V1, 
+    y = V2,
+    fill = status),
+  pch = ifelse(status != "None", 21, 1),
+  col = ifelse(status != "None", "black", "lightgrey"),
+  size = ifelse(status != "None", 1, 0.4)) +
+  scale_fill_manual(values = c(
+  	"Anterior" = as.character(celltype_colours["Paraxial mesoderm"]),
+  	"Posterior" = as.character(celltype_colours["Somitic mesoderm"]),
+    "NMP" = as.character(celltype_colours["NMP"]),
+    "CM" = as.character(celltype_colours["Caudal Mesoderm"]),
+  	"Ant/Post" = "orange",
+    "Post/CM" = "pink",
+    "CM/NMP" = "red",
+  	"None" = "lightgrey")) +
+  theme(#legend.position = "none",
+    axis.text = element_blank(),
+    axis.ticks = element_blank()) +
+  labs(x = "UMAP1", y = "UMAP2") +
+  guides(fill = guide_legend(override.aes = list(size = 5, pch = 21)))
+
+p
+
+```
+
+```{r}
+
+status = sapply(rownames(umap), function(x){
+  if(x %in% meta_ant$cell & x %in% meta_post$cell){
+    return("Ant/Post")
+  } else if(x %in% meta_cm$cell & x %in% meta_post$cell){
+    return("Post/CM")
+  } else if(x %in% meta_sc$cell & x %in% meta_nmp$cell){
+    return("NMP/SC")
+  } else if(x %in% meta_cm$cell & x %in% meta_nmp$cell){
+    return("CM/NMP")
+  } else if (x %in% meta_ant$cell){
+    return("Anterior")
+  } else if (x %in% meta_post$cell){
+    return("Posterior")
+  } else if (x %in% meta_nmp$cell){
+    return("NMP")
+  } else if (x %in% meta_sc$cell){
+    return("SC")
+  } else if (x %in% meta_cm$cell){
+    return("CM")
+  } else {
+    return("None")
+  }
+})
+status = factor(status, levels = c("None", "Anterior", "Posterior", "NMP", "CM", "SC", "Ant/Post", "CM/NMP", "Post/CM", "NMP/SC"), ordered = TRUE)
+umap = umap[order(status),]
+status = status[order(status)]
+p = ggplot(data = umap) +
+  geom_point(mapping = aes(
+    x = V1, 
+    y = V2,
+    fill = status),
+  pch = ifelse(status != "None", 21, 1),
+  col = ifelse(status != "None", "black", "lightgrey"),
+  size = ifelse(status != "None", 1, 0.4)) +
+  scale_fill_manual(values = c(
+    "Anterior" = as.character(celltype_colours["Paraxial mesoderm"]),
+    "Posterior" = as.character(celltype_colours["Somitic mesoderm"]),
+    "NMP" = as.character(celltype_colours["NMP"]),
+    "CM" = as.character(celltype_colours["Caudal Mesoderm"]),
+    "SC" = as.character(celltype_colours["Spinal cord"]),
+    "Ant/Post" = "orange",
+    "Post/CM" = "pink",
+    "CM/NMP" = "red",
+    "NMP/SC" = "brown",
+    "None" = "lightgrey")) +
+  theme(#legend.position = "none",
+    axis.text = element_blank(),
+    axis.ticks = element_blank()) +
+  labs(x = "UMAP1", y = "UMAP2") +
+  guides(fill = guide_legend(override.aes = list(size = 5, pch = 21)))
+
+p
+
+ggsave(p, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/somitogenesis/plots/trajectory_all_overlaps.pdf",
+  width = 5, height = 5)
+```
+
+```{r}
+
+status = sapply(rownames(umap), function(x){
+	if (x %in% meta_nmp$cell){
+		return("NMP")
+	} else {
+		return("None")
+	}
+})
+status = factor(status, levels = c("None", "NMP"), ordered = TRUE)
+umap = umap[order(status),]
+status = status[order(status)]
+p = ggplot(data = umap) +
+  geom_point(mapping = aes(
+    x = V1, 
+    y = V2,
+    fill = status),
+  pch = ifelse(status != "None", 21, 1),
+  col = ifelse(status != "None", "black", "lightgrey"),
+  size = ifelse(status != "None", 1, 0.4)) +
+  scale_fill_manual(values = c(
+  	"NMP" = as.character(celltype_colours["NMP"]),
+  	"Neither" = "lightgrey")) +
+  theme(legend.position = "none",
+    axis.text = element_blank(),
+    axis.ticks = element_blank()) +
+  labs(x = "UMAP1", y = "UMAP2")
+
+p
+ggsave(p, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/somitogenesis/plots/trajectory_umap_nmp.pdf",
+	width = 4, height = 4)
+
+```
+
+```{r}
+
+status = sapply(meta$cell, function(x){
+  if(x %in% meta_ant$cell & x %in% meta_post$cell){
+    return("Ant/Post")
+  } else if(x %in% meta_nmp$cell & x %in% meta_post$cell){
+    return("Post/NMP")
+  } else if (x %in% meta_ant$cell){
+    return("Anterior")
+  } else if (x %in% meta_post$cell){
+    return("Posterior")
+  } else if (x %in% meta_nmp$cell){
+    return("NMP")
+  } else {
+    return("None")
+  }
+})
+
+plot_df = data.frame(
+  cell = meta$cell,
+  umap_x = umap[meta$cell,1],
+  umap_y = umap[meta$cell,2],
+  class = status,
+  nmp_ratio = meta$nmp_ratio,
+  nmp_frac_all = masses[meta$cell,"NMP"]/rowSums(masses[meta$cell,]),
+  ant_ratio = meta$ant_ratio,
+  ant_frac_all = masses[meta$cell,"Anterior.most_somites"]/rowSums(masses[meta$cell,]),
+  post_ratio = meta$post_ratio,
+  post_frac_all = masses[meta$cell,"Posterior.most_somites"]/rowSums(masses[meta$cell,])
+)
+plot_df = plot_df[sample(nrow(plot_df)),]
+
+```
+
+
+```{r plot-nmp-masses}
+
+p = ggplot() +
+  geom_point(
+    data = plot_df[plot_df$class != "NMP",],
+    mapping = aes(
+      x = umap_x, 
+      y = umap_y),
+    col = "lightgrey",
+    size = 0.4) +
+  geom_point(
+    data = plot_df[plot_df$class == "NMP",],
+    mapping = aes(
+      x = umap_x, 
+      y = umap_y,
+      col = nmp_ratio),
+    size = 1) +
+  scale_color_viridis_c(name = "NMP mass/\nmax mass") +
+  theme(
+    axis.text = element_blank(),
+    axis.ticks = element_blank()) +
+  labs(x = "UMAP1", y = "UMAP2")
+
+ggsave(p, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/somitogenesis/plots/trajectory_umap_nmp_mass_ratio.pdf",
+  width = 10, height = 8)
+
+p = ggplot() +
+  geom_point(
+    data = plot_df[plot_df$class != "NMP",],
+    mapping = aes(
+      x = umap_x, 
+      y = umap_y),
+    col = "lightgrey",
+    size = 0.4) +
+  geom_point(
+    data = plot_df[plot_df$class == "NMP",],
+    mapping = aes(
+      x = umap_x, 
+      y = umap_y,
+      col = nmp_frac_all),
+    size = 1) +
+  scale_color_viridis_c(name = "NMP mass/\nsum of masses") +
+  theme(
+    axis.text = element_blank(),
+    axis.ticks = element_blank()) +
+  labs(x = "UMAP1", y = "UMAP2")
+
+ggsave(p, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/somitogenesis/plots/trajectory_umap_nmp_mass_all.pdf",
+  width = 10, height = 8)
+```
+```{r plot-ant-masses}
+
+p = ggplot() +
+  geom_point(
+    data = plot_df[plot_df$class != "Anterior",],
+    mapping = aes(
+      x = umap_x, 
+      y = umap_y),
+    col = "lightgrey",
+    size = 0.4) +
+  geom_point(
+    data = plot_df[plot_df$class == "Anterior",],
+    mapping = aes(
+      x = umap_x, 
+      y = umap_y,
+      col = ant_ratio),
+    size = 1) +
+  scale_color_viridis_c(name = "Ant. som. mass/\nmax mass") +
+  theme(
+    axis.text = element_blank(),
+    axis.ticks = element_blank()) +
+  labs(x = "UMAP1", y = "UMAP2")
+
+ggsave(p, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/somitogenesis/plots/trajectory_umap_ant_mass_ratio.pdf",
+  width = 10, height = 8)
+
+p = ggplot() +
+  geom_point(
+    data = plot_df[plot_df$class != "Anterior",],
+    mapping = aes(
+      x = umap_x, 
+      y = umap_y),
+    col = "lightgrey",
+    size = 0.4) +
+  geom_point(
+    data = plot_df[plot_df$class == "Anterior",],
+    mapping = aes(
+      x = umap_x, 
+      y = umap_y,
+      col = ant_frac_all),
+    size = 1) +
+  scale_color_viridis_c(name = "Ant. som. mass/\nsum of masses") +
+  theme(
+    axis.text = element_blank(),
+    axis.ticks = element_blank()) +
+  labs(x = "UMAP1", y = "UMAP2")
+
+ggsave(p, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/somitogenesis/plots/trajectory_umap_ant_mass_all.pdf",
+  width = 10, height = 8)
+```
+
+```{r plot-post-masses}
+
+p = ggplot() +
+  geom_point(
+    data = plot_df[plot_df$class != "Posterior",],
+    mapping = aes(
+      x = umap_x, 
+      y = umap_y),
+    col = "lightgrey",
+    size = 0.4) +
+  geom_point(
+    data = plot_df[plot_df$class == "Posterior",],
+    mapping = aes(
+      x = umap_x, 
+      y = umap_y,
+      col = post_ratio),
+    size = 1) +
+  scale_color_viridis_c(name = "Post. som. mass/\nmax mass") +
+  theme(
+    axis.text = element_blank(),
+    axis.ticks = element_blank()) +
+  labs(x = "UMAP1", y = "UMAP2")
+
+ggsave(p, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/somitogenesis/plots/trajectory_umap_post_mass_ratio.pdf",
+  width = 10, height = 8)
+
+p = ggplot() +
+  geom_point(
+    data = plot_df[plot_df$class != "Posterior",],
+    mapping = aes(
+      x = umap_x, 
+      y = umap_y),
+    col = "lightgrey",
+    size = 0.4) +
+  geom_point(
+    data = plot_df[plot_df$class == "Posterior",],
+    mapping = aes(
+      x = umap_x, 
+      y = umap_y,
+      col = post_frac_all),
+    size = 1) +
+  scale_color_viridis_c(name = "Post. som. mass/\nsum of masses") +
+  theme(
+    axis.text = element_blank(),
+    axis.ticks = element_blank()) +
+  labs(x = "UMAP1", y = "UMAP2")
+
+ggsave(p, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/somitogenesis/plots/trajectory_umap_post_mass_all.pdf",
+  width = 10, height = 8)
+```
+
+```{r plot-post-nmp-masses}
+
+plot_df = data.frame(
+  cell = meta$cell,
+  umap_x = umap[meta$cell,1],
+  umap_y = umap[meta$cell,2],
+  class = status,
+  nmp_ratio = meta$nmp_ratio,
+  nmp_mass = masses[meta$cell,"NMP"],
+  nmp_frac_all = masses[meta$cell,"NMP"]/rowSums(masses[meta$cell,]),
+  post_ratio = meta$post_ratio,
+  post_mass = masses[meta$cell,"Posterior.most_somites"],
+  post_frac_all = masses[meta$cell,"Posterior.most_somites"]/rowSums(masses[meta$cell,])
+)
+plot_df = plot_df[sample(nrow(plot_df)),]
+
+plot_df$mass_ratio = plot_df$nmp_mass/plot_df$post_mass
+#correct div0 NaNs to Inf
+plot_df$mass_ratio[is.na(plot_df$mass_ratio) & plot_df$nmp_mass > 0] = Inf
+#some are 0/0 - set to 1 for plotting purposes
+plot_df$mass_ratio[plot_df$post_mass == 0 & plot_df$nmp_mass == 0] = 1
+
+plot_df$mass_ratio_trimmed = plot_df$mass_ratio
+upper_quant = 2^5#quantile(plot_df$mass_ratio, 0.95)
+plot_df$mass_ratio_trimmed[
+    plot_df$mass_ratio_trimmed > upper_quant
+    ] = upper_quant
+
+lower_quant = 2^-5#quantile(plot_df$mass_ratio, 0.05)
+plot_df$mass_ratio_trimmed[
+    plot_df$mass_ratio_trimmed < lower_quant
+    ] = lower_quant
+
+p = ggplot() +
+  geom_point(
+    data = plot_df[!plot_df$class %in% c("Posterior", "NMP"),],
+    mapping = aes(
+      x = umap_x, 
+      y = umap_y),
+    col = "darkgrey",
+    size = 0.4) +
+  geom_point(
+    data = plot_df[plot_df$class %in% c("Posterior", "NMP"),],
+    mapping = aes(
+      x = umap_x, 
+      y = umap_y,
+      col = log2(mass_ratio_trimmed)),
+    size = 1) +
+  scale_color_gradient2(
+    name = "log2(\nNMP mass/\nPost. som. mass)",
+    low = "#e2c207",
+    high = celltype_colours["NMP"],
+    mid = "white") +
+  theme(
+    axis.text = element_blank(),
+    axis.ticks = element_blank()) +
+  labs(x = "UMAP1", y = "UMAP2")
+
+ggsave(p, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/somitogenesis/plots/trajectory_umap_post_mass_ratio_traj.pdf",
+  width = 10, height = 8)
+
+
+p = ggplot() +
+  geom_point(
+    data = plot_df[!plot_df$class %in% c("Posterior", "NMP"),],
+    mapping = aes(
+      x = umap_x, 
+      y = umap_y,
+      col = log2(mass_ratio_trimmed)),
+    size = 1) +
+  geom_point(
+    data = plot_df[plot_df$class %in% c("Posterior", "NMP"),],
+    mapping = aes(
+      x = umap_x, 
+      y = umap_y,
+      col = log2(mass_ratio_trimmed)),
+    size = 1) +
+  scale_color_distiller(name = "log2(\nNMP mass/\nPost. som. mass)",
+    palette = "Spectral") +
+  theme(
+    axis.text = element_blank(),
+    axis.ticks = element_blank()) +
+  labs(x = "UMAP1", y = "UMAP2")
+
+ggsave(p, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/somitogenesis/plots/trajectory_umap_post_mass_ratio_allcells.pdf",
+  width = 10, height = 8)
+```
+
+## Plotting Peng signature genes on atlas
+
+In our manuscript, we used the Peng et al. spatial embryo atlas to show that genes characteristic of our somitic trajectories corresponded to anterior and posterior restricted genes.
+Can we do the reverse? 
+That is, can we show that the Peng et al. genes map onto restricted regions of e.g. our UMAP?
+So, we load signature genes from the Peng et al. spatial embryo atlas.
+We then want to visualise these in our single-cell RNAseq data.
+
+Because genes are expressed at different levels, we use Z-score transformed data. 
+Additionally, we only consider genes that we detected in our single-cell data (i.e., expressed in at least 100 cells), and whose gene symbol was present in our dataset.
+
+```{r, fig.wide = TRUE}
+# several of these don't have Ensembl IDs
+# so we use the gene IDs
+peng_ant = read.table("data/peng_E7.5_genes_anteriormesoderm.csv",
+                      sep = ",", header = TRUE)
+peng_ant = peng_ant[!is.na(peng_ant$GeneSymbol),]
+peng_ant = peng_ant[peng_ant$GeneSymbol %in% genes[,2],]
+peng_post = read.table("data/peng_E7.5_genes_posteriormeso_streak.csv",
+                      sep = ",", header = TRUE)
+peng_post = peng_post[!is.na(peng_post$GeneSymbol),]
+peng_post = peng_post[peng_post$GeneSymbol %in% genes[,2],]
+
+#many of the genes we don't detect. Let's limit to at least expressed in 100 cells
+expr_ant = logcounts(full_sce[match(peng_ant$GeneSymbol, genes[,2]),])
+z_ant = t(scale(t(expr_ant[Matrix::rowSums(expr_ant > 0) > 99,])))
+expr_post = logcounts(full_sce[match(peng_post$GeneSymbol, genes[,2]),])
+z_post = t(scale(t(expr_post[Matrix::rowSums(expr_post > 0) > 99,])))
+
+
+plot_df = data.frame(
+  cell = meta$cell,
+  umap_x = umap[meta$cell,1],
+  umap_y = umap[meta$cell,2],
+  avg_ant = colMeans(z_ant[, meta$cell]),
+  avg_post = colMeans(z_post[, meta$cell])
+)
+
+p1 = ggplot(plot_df[order(plot_df$avg_ant),], mapping = aes(x = umap_x, y = umap_y, col = avg_ant)) +
+  geom_point(size = 0.4) +
+  # scale_color_distiller(name = "Avg. ant. Z",
+  #   palette = "Spectral") +
+  scale_colour_gradient2(
+    name = "Avg. ant. Z",
+    low = "lightgrey",
+    mid = "cornflowerblue",
+    high = "black",
+    midpoint = max(plot_df$avg_ant)/2
+  ) +
+  theme(
+    axis.text = element_blank(),
+    axis.ticks = element_blank()) +
+  labs(x = "UMAP1", y = "UMAP2") +
+  ggtitle("Anterior mesoderm")
+p2 = ggplot(plot_df[order(plot_df$avg_post),], mapping = aes(x = umap_x, y = umap_y, col = avg_post)) +
+  geom_point(size = 0.4) +
+  scale_colour_gradient2(
+    name = "Avg. post. Z",
+    low = "lightgrey",
+    mid = "cornflowerblue",
+    high = "black",
+    midpoint = max(plot_df$avg_post)/2
+  ) +
+  theme(
+    axis.text = element_blank(),
+    axis.ticks = element_blank()) +
+  labs(x = "UMAP1", y = "UMAP2") +
+  ggtitle("Posterior mesoderm")
+
+grid = plot_grid(p1, p2)
+grid
+ggsave(grid, file = "plots/peng_genes_umap.pdf", width = 10, height = 5)
+```
+
+## "Wedge" plot
+
+A plot that shows the distributions of cells in each of the anterior and posterior somite trajectories, and those shared between trajectories, is shown in Figure \@ref(fig:wedge)
+
+```{r wedge, fig.cap = "Cell frequencies of each trajectory at each timepoint. Cells that are not in either trajectory are excluded."}
+tab1 = table(meta_ant$stage)
+tab2 = table(meta_post$stage)
+tab3 = table(c(meta_ant$stage[meta_ant$cell %in% meta_post$cell], unique(meta_ant$stage)))-1
+
+mat = rbind(tab1, tab2, tab3)
+rownames(mat) = c("Anterior", "Posterior", "Ant/Post")
+
+mlt = melt(mat)
+df = data.frame(cell = unique(c(meta_ant$cell, meta_post$cell)))
+df$timepoint = meta$stage[match(df$cell, meta$cell)]
+df$status = sapply(df$cell, function(x){
+  if(x %in% meta_ant$cell & x %in% meta_post$cell){
+    return("Ant/Post")
+  } else if (x %in% meta_ant$cell){
+    return("Anterior")
+  } else if (x %in% meta_post$cell){
+    return("Posterior")
+  } else {
+    return("None")
+  }
+})
+df = df[order(
+  df$timepoint, 
+  sapply(df$status, switch,
+    "Ant/Post" = 2, "Anterior" = 1, "Posterior" = 3
+    )
+  ),]
+#Each of these is a vector, with each entry corresponding to a single cell.
+#I.e. row one of clusters and timepoints corresponds to the SAME cell.
+#I.e., use metadata columns!
+#timepoints are x-axis, ordered as you want them to appear
+#clusters are y-axis shading 
+#colours should be a named vector of colours, names are the clusters specified.
+#the order of colours specifies the order in the plot
+plot_fn = function(timepoints, clusters, colours = celltype_colours, plateau = FALSE, embryo_doubling = FALSE){
+  
+  df = data.frame(cluster = rep(unique(clusters), length(unique(timepoints))),
+                  stage = do.call(c, lapply(as.character(unique(timepoints)), rep, times = length(unique(clusters)))))
+  
+  
+  
+  df$ranking = match(df$cluster, names(colours))
+  df= df[order(df$stage, df$ranking),]
+
+  df$frac = sapply(seq_len(nrow(df)), function(x){
+    return(sum(clusters == df$cluster[x] & timepoints == df$stage[x])/sum(timepoints == df$stage[x]))
+  })
+  
+  df$cumfrac = NA
+  for(x in 1:nrow(df)){
+    df$cumfrac[x] = sum(df$frac[df$stage == df$stage[x] & df$ranking < df$ranking[x]])
+  }
+  
+  # #manually get TS/stage ordering
+  # if(grepl("TS", df$stage[1])){
+  #   stage_order = paste0("TS", 9:12)
+  #   df$xpos = match(df$stage, paste0("TS", 9:12))
+  # } else {
+  #   stage_order = unique(df$stage)[order(unique(df$stage))]
+  #   df$xpos = match(df$stage, stage_order)
+  # }
+  
+  df$xpos = match(df$stage, unique(timepoints))
+
+  if(plateau){
+    df1 = df
+    df2 = df
+    df1$xpos = df1$xpos - 0.2
+    df2$xpos = df2$xpos + 0.2
+    df = rbind(df1, df2)
+  }
+  
+  if(embryo_doubling){
+    stages = 800*2^(1/5 * seq(from = 0, by = 6, length.out = 5))
+    stages = c(stages,
+               stages[length(stages)] * 2^(1/10 * seq(from = 6, by = 6, length.out = 4)))
+    names(stages) = unique(timepoints)[order(unique(timepoints))]
+    stages = stages[1:length(unique(timepoints))]
+    
+    for(stage in unique(names(stages))){
+      df$cumfrac[df$stage == stage] = df$cumfrac[df$stage == stage] * stages[stage]
+      df$frac[df$stage == stage] = df$frac[df$stage == stage] * stages[stage]
+    }
+    
+  }
+  
+  
+  p = ggplot(df, aes(x = xpos, 
+                       # x = factor(stage, levels = unique(stage)[order(unique(stage))]), 
+                       ymin = cumfrac, 
+                       ymax = cumfrac + frac, 
+                       fill = factor(cluster, levels = names(colours)), 
+                       col = factor(cluster, levels = names(colours)))) +
+    geom_ribbon() +
+    scale_fill_manual(values = colours, drop = FALSE, name = "") +
+    scale_color_manual(values = colours, drop = FALSE, name = "") +
+    scale_x_continuous(breaks = seq_along(unique(timepoints)), labels = unique(timepoints), name = "")
+  
+  if(embryo_doubling)
+    p = p + theme(axis.text.y = element_blank(), axis.ticks.y = element_blank())
+  
+  return(p)
+  
+}
+
+wedge = plot_fn(df$timepoint, df$status, colours = c(
+  "Anterior" = "purple",
+  "Ant/Post" = "orange",
+  "Posterior" = "seagreen4"))
+
+wedge
+
+ggsave(wedge, file = "plots/wedge_plot.pdf", width = 6, height = 3)
+
+m2 = meta
+m2$celltype[!m2$cell %in% df$cell] = "Other"
+m2$celltype[match(df$cell, m2$cell)] = df$status
+m2 = m2[order(m2$stage),]
+m2 = m2[m2$stage != "mixed_gastrulation",]
+wedge2 = plot_fn(m2$stage, m2$celltype, colours = c(
+  "Anterior" = "purple",
+  "Ant/Post" = "orange",
+  "Posterior" = "seagreen4",
+  "Other" = "lightgrey"))
+ggsave(wedge2, file = "plots/wedge_plot_allcells.pdf", width = 6, height = 3)
+
+
+```
+
+## Differential expression of shared ancestors
+
+Do the progenitor cells that are shared between the two somitic trajectories show some unique transcriptional signature?
+We perform differential expression analyses using scran's `findMarkers` function at the E7.0 timepoint, where there are the most (in absolute numbers) of shared trajectory cells, providing greater power/robustness.
+The result file is saved in the folder of this script.
+
+```{r}
+kept_cells = meta$cell[
+  (meta$cell %in% meta_ant$cell | meta$cell %in% meta_post$cell) & meta$stage == "E7.0"]
+sub_sce = scater::normalize(sce[, kept_cells])
+sub_meta = meta[meta$cell %in% kept_cells,]
+sub_meta$trajectory = sapply(sub_meta$cell, function(x){
+  if(x %in% meta_ant$cell & x %in% meta_post$cell){
+    return("Both")
+  } else if(x %in% meta_ant$cell){
+    return("Anterior")
+  } else {
+    return("Posterior")
+  }
+})
+de = findMarkers(sub_sce, clusters = sub_meta$trajectory, pval.type = "all")
+
+de$Both$hgnc = genes[match(rownames(de$Both), genes[,1]),2]
+de$Both$logFC_anterior.posterior = de$Anterior$logFC.Posterior[match(rownames(de$Both), rownames(de$Anterior))]
+write.table(de$Both, file = "de_result_E7.0_shared_progenitors.csv", 
+  sep = "\t", col.names = TRUE, row.names = TRUE, quote = FALSE)
+```
+
+An alternative approach, that may boost power, is to perform differential expression between cells in the uncommitted branch, and all nascent mesoderm cells.
+Which genes mark out these uncommitted somitic cells?
+
+```{r}
+kept_cells = meta$cell[
+  (meta$celltype == "Nascent mesoderm" & meta$stage == "E7.0")]
+sub_sce = scater::normalize(sce[, kept_cells])
+sub_meta = meta[meta$cell %in% kept_cells,]
+sub_meta$trajectory = sapply(sub_meta$cell, function(x){
+  if(x %in% meta_ant$cell & x %in% meta_post$cell){
+    return("Uncommitted_somitic")
+  } else {
+    return("Nascent_mesoderm")
+  }
+})
+de = findMarkers(sub_sce, clusters = sub_meta$trajectory, pval.type = "all")
+
+de$Uncommitted_somitic$hgnc = genes[match(rownames(de$Uncommitted_somitic), genes[,1]),2]
+write.table(de$Uncommitted_somitic, file = "de_result_E7.0_shared_progenitors_vs_all_nascentmeso.csv", 
+  sep = "\t", col.names = TRUE, row.names = TRUE, quote = FALSE)
+```
+
+# Example genes
+
+How do genes change in their expression levels through their developmental trajectories?
+The expression patterns of different panels of genes are shown below, and these figures are used in the paper.
+
+```{r, fig.wide = TRUE, fig.height = 8}
+
+compareSingleGene = function(
+  gene,
+  anterior = sce_ant,
+  posterior = sce_post,
+  nmp = sce_nmp,
+  anterior_stage = meta_ant$stage,
+  posterior_stage = meta_post$stage,
+  nmp_stage = meta_nmp$stage,
+  trajectories = c("post", "ant"),
+  mode = c("meanlogcount", "pctexpr")){
+
+  ant_expr = as.numeric(logcounts(anterior[match(gene, genes[,2]),]))
+  if(mode[1] == "pctexpr"){
+    ant_expr = as.numeric(ant_expr > 0)
+  }
+  df1 = aggregate(
+          ant_expr ~ anterior_stage,
+          FUN = mean
+        )
+  names(df1) = c("stage", "expr")
+  df1$traj = "ant"
+
+  post_expr = as.numeric(logcounts(posterior[match(gene, genes[,2]),]))
+  if(mode[1] == "pctexpr"){
+    post_expr = as.numeric(post_expr > 0)
+  }
+  df2 = aggregate(
+          post_expr ~ posterior_stage,
+          FUN = mean
+        )
+  names(df2) = c("stage", "expr")
+  df2$traj = "post"
+
+  nmp_expr = as.numeric(logcounts(nmp[match(gene, genes[,2]),]))
+  if(mode[1] == "pctexpr"){
+    nmp_expr = as.numeric(nmp_expr > 0)
+  }
+  df3 = aggregate(
+          nmp_expr ~ nmp_stage,
+          FUN = mean
+        )
+  names(df3) = c("stage", "expr")
+  df3$traj = "nmp"
+
+  df = data.frame()
+  if("ant" %in% trajectories) df = rbind(df, df1)
+  if("post" %in% trajectories) df = rbind(df, df2)
+  if("nmp" %in% trajectories) df = rbind(df, df3)
+
+  p = ggplot(
+    data = df, 
+    mapping = aes(
+      x = stage, 
+      y = expr, 
+      group = traj, 
+      col = traj, 
+      fill = traj)) +
+    geom_line(lwd = 1) +
+    scale_colour_manual(
+      values = c("ant" = "purple", "post" = "seagreen4", "nmp" = "#DD9E24"),
+      labels = c("ant" = "Anterior", "post" = "Posterior", "nmp" = "NMP")) +
+    labs(x = "Timepoint", y = "Mean log count") +
+    theme(axis.text.x = element_blank(),
+      axis.title = element_blank(),
+      legend.position = "none") +
+    ggtitle(gene)
+
+
+
+  return(p)
+}
+
+som_genes = c("Eomes", "T", "Tbx6", "Meox1", "Aldh1a2", "Cyp26a1", "Cdx1", "Lmo2", "Tbx1", "Tcf15", "Tcf21", "Tbx3", "Mixl1")
+
+plots = lapply(som_genes, compareSingleGene)
+
+grid = plot_grid(plotlist = plots, ncol = 3, align = "hv")
+
+grid
+ggsave(
+  grid, 
+  file = "/nfs/research1/marioni/jonny/chimera-t/scripts/somitogenesis/plots/tiled_gene_traj.pdf",
+  width = 6, height = 6)
+
+plots = lapply(som_genes, compareSingleGene, mode = "pctexpr")
+
+grid = plot_grid(plotlist = plots, ncol = 3, align = "hv")
+
+grid
+ggsave(
+  grid, 
+  file = "/nfs/research1/marioni/jonny/chimera-t/scripts/somitogenesis/plots/tiled_gene_traj_pctexpr.pdf",
+  width = 6, height = 6)
+
+```
+
+
+```{r, fig.wide = TRUE, fig.height = 8}
+
+som_genes = c("Nanog", "Mixl1", "Cdh1", "Cdh2", "Snai1", "Prrx2", "Prrx1", "Irx3", "Irx1", "Alx1", "Sfrp1", "Phlda2", "Hand1", "Pmp22", "Tcf15")
+
+plots = lapply(som_genes, compareSingleGene)
+
+grid = plot_grid(plotlist = plots, ncol = 3, align = "hv")
+
+grid
+ggsave(
+  grid, 
+  file = "/nfs/research1/marioni/jonny/chimera-t/scripts/somitogenesis/plots/tiled_gene_traj_bonus_genes.pdf",
+  width = 6, height = 6)
+```
+
+```{r, fig.wide = TRUE, fig.height = 8}
+
+som_genes = c("Nanog", "Mixl1", "Cdh1", "Cdh2", "Snai1", "Prrx2", "Prrx1", "Irx3", "Irx1", "Alx1", "Sfrp1", "Phlda2", "Hand1", "Pmp22", "Tcf15")
+
+plots = lapply(som_genes, compareSingleGene)
+
+grid = plot_grid(plotlist = plots, ncol = 3, align = "hv")
+
+grid
+ggsave(
+  grid, 
+  file = "/nfs/research1/marioni/jonny/chimera-t/scripts/somitogenesis/plots/tiled_gene_traj_bonus_genes.pdf",
+  width = 6, height = 6)
+
+```
+
+```{r, fig.wide = TRUE, fig.height = 4}
+
+genes2 = c("Mesp1", "Pax3", "Lmo1", "Etv2")
+plots = lapply(genes2, compareSingleGene)
+
+grid = plot_grid(plotlist = plots, ncol = 2, align = "hv")
+
+grid
+ggsave(
+  grid, 
+  file = "/nfs/research1/marioni/jonny/chimera-t/scripts/somitogenesis/plots/tiled_gene_traj_bonus_genes_additional.pdf",
+  width = 4, height = 3)
+
+```
+
+# Example genes with NMP
+
+Here are a set of gene expression dynamic plots
+
+```{r, fig.wide = TRUE, fig.height = 18}
+
+nmp_genes = c("Sox2", "Nkx1-2", "Cdx2", "Cdx4", "Eomes", "T", "Tbx6", "Meox1", "Aldh1a2", "Cyp26a1", "Cdx1", "Tcf15", "Nanog", "Mixl1", "Cdh1", "Cdh2", "Snai1", "Prrx2", "Prrx1", "Irx3", "Irx1", "Alx1", "Sfrp1", "Hand1", "Pmp22", "Mesp1", "Pax3", "Lmo1", "Etv2")
+
+plots = lapply(nmp_genes, compareSingleGene, trajectories = c("ant", "post", "nmp"))
+
+grid = plot_grid(plotlist = plots, ncol = 3, align = "hv")
+
+grid
+ggsave(
+  grid, 
+  file = "/nfs/research1/marioni/jonny/chimera-t/scripts/somitogenesis/plots/tiled_gene_traj_NMP.pdf",
+  width = 6, height = 12)
+
+plots = lapply(nmp_genes, compareSingleGene, trajectories = c("ant", "post", "nmp"), mode = "pctexpr")
+grid = plot_grid(plotlist = plots, ncol = 3, align = "hv")
+ggsave(
+  grid, 
+  file = "/nfs/research1/marioni/jonny/chimera-t/scripts/somitogenesis/plots/tiled_gene_traj_NMP_pctexpr.pdf",
+  width = 6, height = 12)
+
+```
+
+```{r, fig.wide = TRUE, fig.height = 4}
+
+nmp_genes = c("Rspo3", "Dll1", "Dusp6", "Tbx3")
+
+plots = lapply(nmp_genes, compareSingleGene, trajectories = c("ant", "post", "nmp"))
+
+grid = plot_grid(plotlist = plots, ncol = 3, align = "hv")
+
+grid
+ggsave(
+  grid, 
+  file = "/nfs/research1/marioni/jonny/chimera-t/scripts/somitogenesis/plots/tiled_gene_traj_NMP_extragenes.pdf",
+  width = 6, height = 4)
+
+plots = lapply(nmp_genes, compareSingleGene, trajectories = c("ant", "post", "nmp"), mode = "pctexpr")
+grid = plot_grid(plotlist = plots, ncol = 3, align = "hv")
+ggsave(
+  grid, 
+  file = "/nfs/research1/marioni/jonny/chimera-t/scripts/somitogenesis/plots/tiled_gene_traj_NMP_pctexpr_extragenes.pdf",
+  width = 6, height = 4)
+
+```
+
+```{r, fig.wide = TRUE, fig.height = 3}
+
+nmp_genes = c("Wnt3a", "Sp5")
+
+plots = lapply(nmp_genes, compareSingleGene, trajectories = c("ant", "post"))
+
+grid = plot_grid(plotlist = plots, ncol = 2, align = "hv")
+
+grid
+ggsave(
+  grid, 
+  file = "/nfs/research1/marioni/jonny/chimera-t/scripts/somitogenesis/plots/tiled_gene_traj_noNMP_reallyextragenes.pdf",
+  width = 4, height = 2)
+
+plots = lapply(nmp_genes, compareSingleGene, trajectories = c("ant", "post"), mode = "pctexpr")
+grid = plot_grid(plotlist = plots, ncol = 2, align = "hv")
+ggsave(
+  grid, 
+  file = "/nfs/research1/marioni/jonny/chimera-t/scripts/somitogenesis/plots/tiled_gene_traj_noNMP_pctexpr_reallyextragenes.pdf",
+  width = 4, height = 2)
+
+```
+
+```{r, fig.wide = TRUE, fig.height = 6}
+
+nmp_genes = c(
+  "Fst",
+  "Epcam",
+  "Pou5f1",
+  "Dll3",
+  "Lefty2",
+  "Fn1")
+
+plots = lapply(nmp_genes, compareSingleGene, trajectories = c("ant", "post", "nmp"))
+
+grid = plot_grid(plotlist = plots, ncol = 2, align = "hv")
+
+grid
+ggsave(
+  grid, 
+  file = "/nfs/research1/marioni/jonny/chimera-t/scripts/somitogenesis/plots/tiled_gene_traj_noNMP_reallyextraextragenes.pdf",
+  width = 4, height = 6)
+
+plots = lapply(nmp_genes, compareSingleGene, trajectories = c("ant", "post", "nmp"), mode = "pctexpr")
+grid = plot_grid(plotlist = plots, ncol = 2, align = "hv")
+ggsave(
+  grid, 
+  file = "/nfs/research1/marioni/jonny/chimera-t/scripts/somitogenesis/plots/tiled_gene_traj_noNMP_pctexpr_reallyextraextragenes.pdf",
+  width = 4, height = 6)
+
+```
+
+```{r, fig.wide = TRUE, fig.height = 16}
+
+epi_meso_genes = c(
+  "Epcam", "Krt10", "Krt18", "Crb3", "Col4a1", "Cldn3", 
+  "Cldn4", "Cldn9", "Tjp1", "Tjp2", "Lamb1", "Vim", 
+  "Lef1", "Zeb1", "Zeb2", "Snai2"
+)
+plots = lapply(epi_meso_genes, compareSingleGene, trajectories = c("ant", "post", "nmp"))
+
+grid = plot_grid(plotlist = plots, ncol = 2, align = "hv")
+
+grid
+ggsave(
+  grid, 
+  file = "/nfs/research1/marioni/jonny/chimera-t/scripts/somitogenesis/plots/tiled_gene_traj_epi_meso_genes.pdf",
+  width = 4, height = 16)
+
+plots = lapply(epi_meso_genes, compareSingleGene, trajectories = c("ant", "post", "nmp"), mode = "pctexpr")
+grid = plot_grid(plotlist = plots, ncol = 2, align = "hv")
+ggsave(
+  grid, 
+  file = "/nfs/research1/marioni/jonny/chimera-t/scripts/somitogenesis/plots/tiled_gene_traj_epi_meso_genes_pctexpr.pdf",
+  width = 4, height = 16)
+
+```
+
+```{r, fig.wide = TRUE, fig.height = 16}
+
+clock_wavefront = c(
+  "Lfng", "Hes7", "Nrarp", "Nkd1", "Dact1", "Axin2", "Dkk1", "Dusp4", "Dusp6", "Spry2", "Spry4", "Wnt3a", "Fgf8", "Fgf4", "Fgfr1", "Dll3", "Dll1", "Notch1", "Aldh1a2", "Cyp26a1", "Mesp2", "Ephb2", "Epha4", "Msgn1"
+)
+plots = lapply(clock_wavefront, compareSingleGene, trajectories = c("ant", "post", "nmp"))
+
+grid = plot_grid(plotlist = plots, ncol = 2, align = "hv")
+
+grid
+ggsave(
+  grid, 
+  file = "/nfs/research1/marioni/jonny/chimera-t/scripts/somitogenesis/plots/tiled_gene_traj_clock_wavefront.pdf",
+  width = 4, height = 24)
+
+plots = lapply(clock_wavefront, compareSingleGene, trajectories = c("ant", "post", "nmp"), mode = "pctexpr")
+grid = plot_grid(plotlist = plots, ncol = 2, align = "hv")
+ggsave(
+  grid, 
+  file = "/nfs/research1/marioni/jonny/chimera-t/scripts/somitogenesis/plots/tiled_gene_traj_clock_wavefront_pctexpr.pdf",
+  width = 4, height = 24)
+
+
+```
+
+```{r}
+new_genes = c("Mef2c", "Slc2a1", "Slc2a3", "Pdk1")
+plots = lapply(new_genes, compareSingleGene, trajectories = c("ant", "post", "nmp"))
+grid = plot_grid(plotlist = plots, ncol = 2, align = "hv")
+grid
+ggsave(
+  grid, 
+  file = "/nfs/research1/marioni/jonny/chimera-t/scripts/somitogenesis/plots/tiled_gene_traj_genes_280820.pdf",
+  width = 4, height = 4)
+
+plots = lapply(new_genes, compareSingleGene, trajectories = c("ant", "post", "nmp"), mode = "pctexpr")
+grid = plot_grid(plotlist = plots, ncol = 2, align = "hv")
+ggsave(
+  grid, 
+  file = "/nfs/research1/marioni/jonny/chimera-t/scripts/somitogenesis/plots/tiled_gene_traj_genes_280820_pctexpr.pdf",
+  width = 4, height = 4)
+
+```
+
+# EMT gene coexpression
+
+
+```{r, fig.wide = TRUE, fig.height = 8}
+plot_df = data.frame(
+  cell = meta_nmp$cell,
+  stage = meta_nmp$stage,
+  celltype = meta_nmp$celltype,
+  expr_Epcam = logcounts(sce_nmp)[genes[,2] == "Epcam",],
+  expr_Vim = logcounts(sce_nmp)[genes[,2] == "Vim",],
+  expr_Cldn3 = logcounts(sce_nmp)[genes[,2] == "Cldn3",],
+  expr_Zeb2 = logcounts(sce_nmp)[genes[,2] == "Zeb2",]
+)
+
+# cor_vec = sapply(unique(plot_df$stage), function(x) cor(plot_df$expr_Epcam[plot_df$stage == x], 
+#                                                         plot_df$expr_Vim[plot_df$stage == x]))
+# names(cor_vec) = unique(plot_df$stage)
+# cor_vec = cor_vec[order(names(cor_vec))]
+
+coexp_vec = sapply(unique(plot_df$stage), function(x) mean(plot_df$expr_Epcam[plot_df$stage == x] > 0 &
+                                                           plot_df$expr_Vim[plot_df$stage == x] > 0))
+names(coexp_vec) = unique(plot_df$stage)
+coexp_vec = coexp_vec[order(names(coexp_vec))]
+
+plot_df$stage_label_1 = paste0(plot_df$stage, " (",  format(coexp_vec[plot_df$stage]*100, digits = 2), "%)")
+
+p = ggplot(plot_df, aes(x = expr_Epcam, y = expr_Vim, fill = stage)) +
+    geom_point(pch = 21, size = 1.2, col = "black") +
+    labs(x = "Epcam logcount", y = "Vim logcount") +
+    facet_wrap(~stage_label_1) +
+    scale_fill_manual(values = stage_colours)
+
+p
+
+ggsave(p, file = "plots/coexp_nmptraj_Epcam_Vim.pdf", width = 7, height = 6)
+```
+
+```{r, fig.wide = TRUE, fig.height = 8}
+coexp_vec = sapply(unique(plot_df$stage), function(x) mean(plot_df$expr_Cldn3[plot_df$stage == x] > 0 &
+                                                           plot_df$expr_Zeb2[plot_df$stage == x] > 0))
+names(coexp_vec) = unique(plot_df$stage)
+coexp_vec = coexp_vec[order(names(coexp_vec))]
+
+plot_df$stage_label_2 = paste0(plot_df$stage, " (",  format(coexp_vec[plot_df$stage]*100, digits = 2), "%)")
+
+p = ggplot(plot_df, aes(x = expr_Cldn3, y = expr_Zeb2, fill = stage)) +
+    geom_point(pch = 21, size = 1.2, col = "black") +
+    labs(x = "Cldn3 logcount", y = "Zeb2 logcount") +
+    facet_wrap(~stage_label_2) +
+    scale_fill_manual(values = stage_colours)
+
+p
+
+ggsave(p, file = "plots/coexp_nmptraj_Cldn3_Zeb2.pdf", width = 7, height = 6)
+
+```
+
+How do these vary over time in each of the trajectories?
+
+```{r, fig.wide = TRUE, fig.height = 8}
+mat = sapply(list(meta_nmp, meta_post, meta_ant), function(x){
+  out = sapply(unique(meta$stage), function(y){
+    vim = as.numeric(logcounts(sce[match("Vim", genes[,2]), x$cell[x$stage == y]]))
+    epcam = as.numeric(logcounts(sce[match("Epcam", genes[,2]), x$cell[x$stage == y]]))
+    both = vim > 0 & epcam > 0
+    return(mean(both))
+  })
+  names(out) = unique(meta$stage)
+  return(out)
+})
+colnames(mat) = c("NMP", "Post", "Ant")
+mat = mat[order(rownames(mat)),]
+
+mlt = melt(mat)
+names(mlt) = c("stage", "traj", "frac")
+
+p = ggplot(mlt, aes(x = stage, y = frac, fill = traj)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  # facet_wrap(~traj, ncol = 1) +
+  scale_fill_manual(values = c("NMP" = as.character(celltype_colours["NMP"]),
+                               "Ant" = as.character(celltype_colours["Paraxial mesoderm"]),
+                               "Post" = as.character(celltype_colours["Somitic mesoderm"]))) +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 30, hjust = 1, vjust = 1)) +
+  labs(y = "Frac. Vim+Epcam+ cells")
+
+p
+ggsave(p, file = "plots/coexp_alltraj_barplot.pdf", width = 6, height = 4)
+ 
+```
+
+# Differential abundance in the somite subclusters
+
+```{r}
+#retain the E8.5 atlas cells and their subclusters
+annots = rbind(annot_post, annot_ant)
+atlas_sce = scater::normalize(sce[, annots$cell])
+atlas_meta = meta[match(annots$cell, meta$cell),]
+atlas_meta$subct = annots$celltype
+
+source("/nfs/research1/marioni/jonny/chimera-wt/scripts/core_functions.R")
+load_data()
+wt_sce = sce[, meta$celltype.mapped %in% c("Somitic mesoderm", "Paraxial mesoderm") &
+                meta$stage == "E8.5"]
+wt_meta = meta[meta$celltype.mapped %in% c("Somitic mesoderm", "Paraxial mesoderm")&
+                meta$stage == "E8.5", ]
+
+source("/nfs/research1/marioni/jonny/chimera-t/scripts/core_functions.R")
+load_data()
+sce = sce[, meta$celltype.mapped %in% c("Somitic mesoderm", "Paraxial mesoderm") &
+                meta$stage == "E8.5"]
+meta = meta[meta$celltype.mapped %in% c("Somitic mesoderm", "Paraxial mesoderm") &
+                meta$stage == "E8.5", ]
+
+save(sce, meta, atlas_sce, atlas_meta, wt_sce, wt_meta, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/somitogenesis/subct_mapping.RData")
+
+```
+
+```{r}
+
+atlas_meta$celltype_big = atlas_meta$celltype
+atlas_meta$celltype = atlas_meta$subct
+mappings_t = lapply(unique(meta$sample), function(x){
+  mapWrap(atlas_sce, 
+          atlas_meta, 
+          sce[-nrow(sce), meta$sample == x], 
+          meta[meta$sample == x,])
+})
+mappings_t = do.call(rbind, mappings_t)
+meta$som.cluster = mappings_t$celltype.mapped[match(meta$cell, mappings_t$cell)]
+
+mappings_wt = lapply(unique(wt_meta$sample), function(x){
+  mapWrap(atlas_sce, 
+          atlas_meta, 
+          wt_sce[-nrow(wt_sce), wt_meta$sample == x], 
+          wt_meta[wt_meta$sample == x,])
+})
+mappings_wt = do.call(rbind, mappings_wt)
+wt_meta$som.cluster = mappings_wt$celltype.mapped[match(wt_meta$cell, mappings_wt$cell)]
+
+```
+
+```{r}
+temp_t = meta
+temp_t$celltype.mapped = temp_t$som.cluster
+
+temp_wt = wt_meta
+temp_wt$celltype.mapped = temp_wt$som.cluster
+
+dabun = testDifferentialAbundance(temp_t, temp_wt)
+
+sig = dabun[dabun$FDR < 0.1,]
+sig$ypos = sig$logFC  + 0.2 * sign(sig$logFC)
+
+write.table(dabun, 
+  file = "diff_abun_somite_clusters.csv",
+  sep = ",",
+  quote = FALSE,
+  col.names = TRUE,
+  row.names = TRUE)
+
+p = ggplot(dabun, mapping = aes(x = rownames(dabun), y = logFC, fill = rownames(dabun))) +
+  geom_bar(stat = "identity", col = "black") +
+  scale_fill_brewer(palette = "Set1") +
+  theme(legend.position = "none",
+        axis.title.x =  element_blank(),
+        axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) +
+  labs(y = "log2FC (injected T-KO\nvs injected WT)") +
+  geom_text(data = sig, mapping = aes(y = ypos, x = rownames(sig)), inherit.aes = FALSE, label = "*", size = 6, nudge_y = -0.2) +
+  coord_flip()
+
+p
+
+ggsave(p, file = "plots/dabun_somclusts.pdf", width = 5, height = 7)
+
+```
+
+```{r}
+
+p1 = ggplot(meta, aes(x = som.cluster, fill = tomato)) +
+  geom_bar(position = "dodge", col = "black") +
+  scale_fill_manual(values = c("TRUE" = "red", "FALSE" = "black")) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5),
+    axis.title.x = element_blank()) +
+  labs(y = "# cells") +
+  ggtitle("T chimera")
+p2 = ggplot(wt_meta, aes(x = som.cluster, fill = tomato)) +
+  geom_bar(position = "dodge", col = "black") +
+  scale_fill_manual(values = c("TRUE" = "red", "FALSE" = "black")) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5),
+    axis.title.x = element_blank()) +
+  labs(y = "# cells") +
+  ggtitle("WT chimera")
+
+plot_grid(p1,p2)
+
+```
+
+# Mapping chimaera samples to the trajectories
+
+```{r}
+
+chimera_meta = read.table("/nfs/research1/marioni/jonny/chimera-t/data/meta.tab",
+  sep = "\t", header = TRUE, stringsAsFactors = FALSE)
+chimera_meta = chimera_meta[
+  chimera_meta$pool != 2 & 
+  !chimera_meta$celltype.mapped %in% c("Stripped", "Doublet", "ExE ectoderm", "ExE endoderm", "Parietal endoderm"),]
+
+chimera_meta$is_ant = chimera_meta$closest.cell %in% meta_ant$cell
+chimera_meta$is_post = chimera_meta$closest.cell %in% meta_post$cell
+chimera_meta$is_nmp = chimera_meta$closest.cell %in% meta_nmp$cell
+
+chimera_meta$traj = sapply(1:nrow(chimera_meta), function(x){
+  if(chimera_meta$is_nmp[x]){
+    return("NMP")
+  } else if(chimera_meta$is_ant[x]){
+    return("Anterior")
+  } else if(chimera_meta$is_post[x]){
+    return("Posterior")
+  } else {
+    return(NA)
+  }
+})
+
+tab = table(
+  chimera_meta[!is.na(chimera_meta$traj) & chimera_meta$stage == "E7.5", "traj"],
+  chimera_meta[!is.na(chimera_meta$traj) & chimera_meta$stage == "E7.5", "tomato"]
+  )
+tab = sweep(tab, 2, sapply(colnames(tab), function(x) sum(chimera_meta$tomato == x)), "/")
+mlt = melt(tab)
+
+tab = table(
+  chimera_meta[!is.na(chimera_meta$traj) & chimera_meta$stage == "E8.5", "traj"],
+  chimera_meta[!is.na(chimera_meta$traj) & chimera_meta$stage == "E8.5", "tomato"]
+  )
+tab = sweep(tab, 2, sapply(colnames(tab), function(x) sum(chimera_meta$tomato == x)), "/")
+mlt2 = melt(tab)
+
+mlt$stage = "E7.5"
+mlt2$stage = "E8.5"
+
+mlt = rbind(mlt, mlt2)
+colnames(mlt) = c("traj", "tomato", "pct", "stage")
+
+p = ggplot(mlt, aes(x = traj, fill = tomato, y = pct)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  facet_wrap(~stage) +
+  scale_fill_manual(values = c("TRUE" = "red", "FALSE" = "black")) +
+  labs(y = "Fraction of cells")
+
+p
+
+chimera_meta$traj2 = chimera_meta$traj
+chimera_meta$traj2[is.na(chimera_meta$traj2)] = "other"
+
+tab = table(
+  chimera_meta[chimera_meta$stage == "E7.5", "traj2"] == "Anterior",
+  chimera_meta[chimera_meta$stage == "E7.5", "tomato"]
+  )
+
+```
+
+# Looking for genes with variable expression over time
+
+We are interested in looking for differences between the NMP and the posterior somite trajectories in a non-snapshot way i.e. over all cells in the trajectory over time.
+First, we select genes that vary along the developmental trajectories (any of them) as in Pijuan-Sala et al. 2019
+
+```{r}
+
+selectVariableGenesTimepoint = function(sce, stages, pval = 0.1, min.mean = 0.1){
+  #get HVGs
+  hvg = getHVGs(sce, min.mean = min.mean)
+  #check for variability across timepoints
+  #allocate an evenly spaced numeric value across timepoints
+  unq_stages = unique(stages)
+  num = seq(length(unq_stages)) - length(unq_stages)/2
+  names(num) = unq_stages[order(unq_stages)]
+
+    #collapse to per-stage measurement
+  sample_means = sapply(unique(stages), function(x){
+    Matrix::rowMeans(logcounts(sce[hvg, stages == x]))
+  })
+  sample_means = sample_means[, order(colnames(sample_means))]
+  tp_num = num[colnames(sample_means)]
+
+  alts = lapply(1:nrow(sample_means), function(x){
+      return(lm(sample_means[x,] ~ tp_num + I(tp_num^2) + I(tp_num^3)))
+    })
+    null = lapply(1:nrow(sample_means), function(x){
+      return(lm(sample_means[x,] ~ 1))
+    })
+
+    anovas = lapply(seq_along(hvg), function(x) anova(null[[x]], alts[[x]]))
+    ps = sapply(anovas, function(x) x$`Pr(>F)`[2])
+
+    return(hvg[p.adjust(ps, method = "fdr") < pval])
+}
+
+genes_clust = unique(c(
+  selectVariableGenesTimepoint(sce_nmp, meta_nmp$stage),
+  selectVariableGenesTimepoint(sce_post, meta_post$stage),
+  selectVariableGenesTimepoint(sce_ant, meta_ant$stage)
+  ))
+
+```
+
+```{r}
+makeMeanMat = function(sce, meta){
+  means = sapply(unique(meta$stage), function(x){
+    Matrix::rowMeans(logcounts(sce[, meta$stage == x]))
+  })
+  means = means[, order(colnames(means))]
+  return(means)
+}
+
+makePctMat = function(sce, meta){
+  means = sapply(unique(meta$stage), function(x){
+    Matrix::rowMeans(logcounts(sce[, meta$stage == x]) > 0)
+  })
+  means = means[, order(colnames(means))]
+  return(means)
+}
+
+means_nmp = makeMeanMat(sce_nmp, meta_nmp)
+means_post = makeMeanMat(sce_post, meta_post)
+means_ant = makeMeanMat(sce_ant, meta_ant)
+
+```
+
+Next, we compare two models.
+The data for these models is the mean expression level (log count) of a gene at each timepoint for each trajectory.
+The null model is that the mean expression level of these genes can be predicted with a third-order polynomial along timepoints, irrespective of the trajectory.
+The alternative model includes an interaction term for every coefficient with the trajectory.
+This allows for a fully different polynomial to be fitted to each trajectory.
+If the alternative model fits the data better than the null model, it suggests that the gene's expression is not the same along each of the trajectories.
+We it this model to the subset of genes identified above, in this section.
+
+```{r nmp-post}
+dyntraj = function(gene, means_group_1, means_group_2){
+  data = data.frame(
+    expr = c(means_group_1[gene,], means_group_2[gene,]),
+    timepoint = scale(
+      c(1:ncol(means_group_1), 1:ncol(means_group_2)),
+      center = TRUE,
+      scale = FALSE
+      ),
+    traj = c(rep("g1", ncol(means_group_1)), rep("g2", ncol(means_group_2))
+    ))
+  mod1 = lm(expr ~ poly(timepoint, 3), data = data)
+  mod2 = lm(expr ~ poly(timepoint, 3)*traj, data = data)
+  ftest = anova(mod1, mod2)
+  pval = ftest$`Pr(>F)`[2]
+  return(data.frame(
+    gene = gene, 
+    mgi = get_mgi(gene),
+    p_diff_lm = pval
+  ))
+}
+
+collate_dyn = function(gene_vec, means1, means2){
+  df = do.call(rbind, lapply(gene_vec, dyntraj, means_group_1 = means1, means_group_2 = means2))
+  df$fdr_diff_lm = p.adjust(df$p_diff_lm, method = "fdr")
+  return(df)
+}
+
+ant_vs_post = collate_dyn(genes_clust, means_ant, means_post)
+ant_vs_nmp = collate_dyn(genes_clust, means_ant, means_nmp)
+nmp_vs_post = collate_dyn(genes_clust, means_nmp, means_post)
+
+dir = "rev1_compare_trajectories"
+if(!dir.exists(dir))
+  dir.create(dir)
+
+write.table(nmp_vs_post, file = file.path(dir, "tests_across_traj_post_nmp.csv"),
+  sep = ",", row.names = FALSE, col.names = TRUE, quote = FALSE)
+write.table(ant_vs_nmp, file = file.path(dir, "tests_across_traj_ant_nmp.csv"),
+  sep = ",", row.names = FALSE, col.names = TRUE, quote = FALSE)
+write.table(ant_vs_post, file = file.path(dir, "tests_across_traj_post_ant.csv"),
+  sep = ",", row.names = FALSE, col.names = TRUE, quote = FALSE)
+
+
+mgi_clust = genes[match(genes_clust, genes[,1]),2]
+plots = lapply(mgi_clust, compareSingleGene, trajectories = c("ant", "post", "nmp"))
+subdir = "gene_plots"
+if(!dir.exists(file.path(dir, subdir)))
+  dir.create(file.path(dir, subdir))
+
+for(i in seq_along(mgi_clust)){
+  ggsave(plots[[i]], file = file.path(dir, subdir, paste0(mgi_clust[i], ".png")),
+         width = 3, height = 3)
+}
+
+```
+
+A bonus piece of code below includes a comparison of all models simultaneously.
+This wasn't used in the paper.
+
+```{r bonus-triple}
+dyntraj3 = function(gene){
+  data = data.frame(
+    expr = c(means_ant[gene,], means_post[gene,], means_nmp[gene,]),
+    timepoint = scale(
+      c(1:ncol(means_ant), 1:ncol(means_post), 1:ncol(means_nmp)),
+      center = TRUE,
+      scale = FALSE
+      ),
+    traj = c(rep("ant", ncol(means_ant)), rep("post", ncol(means_post)), rep("nmp", ncol(means_nmp))
+    ))
+  mod1 = lm(expr ~ poly(timepoint, 3), data = data)
+  mod2 = lm(expr ~ poly(timepoint, 3)*traj, data = data)
+  ftest = anova(mod1, mod2)
+  pval = ftest$`Pr(>F)`[2]
+  return(data.frame(
+    gene = gene, 
+    mgi = get_mgi(gene),
+    p_diff_lm = pval
+  ))
+}
+
+collate_dyn3 = function(gene_vec){
+  df = do.call(rbind, lapply(gene_vec, dyntraj3))
+  df$fdr_diff_lm = p.adjust(df$p_diff_lm, method = "fdr")
+  return(df)
+}
+write.table(collate_dyn3(genes_clust), file = file.path(dir, "tests_across_traj_triple.csv"),
+  sep = ",", row.names = FALSE, col.names = TRUE, quote = FALSE)
+```
+
+# Save data for MouseGastrulationData
+
+```{r}
+masses = read.table("/nfs/research1/marioni/jonny/chimera-t/scripts/somitogenesis/data/corrected/E85_all_trajectories.txt", sep = "\t", header = TRUE, row.names = 1)
+masses = masses[, -which(grepl("id.[0-9]", colnames(masses)))]
+masses = masses[, !names(masses) %in% c("Paraxial.mesoderm", "Somitic.mesoderm")]
+names(masses) = gsub(".", " ", names(masses), fixed = TRUE)
+names(masses) = gsub(" most_somites", "-most_somites", names(masses), fixed = TRUE)
+names(masses)[names(masses) == "Def  endoderm"] = "Def. endoderm"
+names(masses)[names(masses) == "Forebrain Midbrain Hindbrain"] = "Forebrain/Midbrain/Hindbrain"
+write.table(masses, 
+  file = "/nfs/research1/marioni/jonny/chimera-t/data/MGD/atlas_WOT_masses.tsv",
+  sep = "\t", quote = FALSE, row.names = TRUE, col.names = TRUE)
+
+#trajectory membership
+status = sapply(full_meta$cell, function(x){
+  if(full_meta$stage[match(x, full_meta$cell)] == "mixed_gastrulation"){
+    return(NA)
+  }
+  if(x %in% meta_ant$cell & x %in% meta_post$cell){
+    return("Ant/Post")
+  } else if(x %in% meta_nmp$cell & x %in% meta_post$cell){
+    return("Post/NMP")
+  } else if(x %in% meta_nmp$cell & x %in% meta_ant$cell){
+    return("Ant/NMP")
+  } else if(x %in% meta_nmp$cell & x %in% meta_post$cell & x %in% meta_ant$cell){
+    return("Ant/Post/NMP")
+  } else if (x %in% meta_ant$cell){
+    return("Anterior")
+  } else if (x %in% meta_post$cell){
+    return("Posterior")
+  } else if (x %in% meta_nmp$cell){
+    return("NMP")
+  } else {
+    return("None")
+  }
+})
+df = data.frame(row.names = full_meta$cell, trajectory = status)
+write.table(df, 
+  file = "/nfs/research1/marioni/jonny/chimera-t/data/MGD/atlas_WOT_trajectory_membership.tsv",
+  sep = "\t", quote = FALSE, row.names = TRUE, col.names = FALSE)
+
+```
+
+# Session Info
+```{r sessinf}
+sessionInfo()
+```
+
+

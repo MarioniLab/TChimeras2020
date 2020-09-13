@@ -1,0 +1,343 @@
+---
+title: "_T_ chimera: Batch correction"
+author: "C. Guibentif, J. Griffiths et al. Chimera"
+output:
+  BiocStyle::html_document:
+    code_folding: hide
+    number_sections: yes
+    toc: yes  
+---
+
+
+```{r setup, message=FALSE}
+library(Matrix)
+library(scran)
+library(Rtsne)
+library(irlba)
+library(cowplot)
+library(biomaRt)
+
+source("/nfs/research1/marioni/jonny/chimera-t/scripts/core_functions.R")
+load_data(remove_doublets = TRUE, remove_stripped = TRUE, remove_pool2 = TRUE)
+
+nPC = 50
+
+
+```
+
+In this script, we perform batch correction on our data.
+
+
+#Batch correction
+
+For batch correction, we employ the scran function `fastMNN`, which performs batch correction in the manner of `mnnCorrect`, but in the PC-space, and much faster. Critically, this is a composition-aware batch-correction strategy that should not be affected by the lack of e.g. extraembryonic tissue in the Tomato+ samples (as the injected stem cells do not contribute to these lineages). We correct within each timepoint only.
+
+##Total correction
+
+```{r mnncorrect-1}
+
+hvgs_E7.5 = getHVGs(scater::normalize(sce[,meta$stage == "E7.5"]))
+hvgs_E8.5 = getHVGs(scater::normalize(sce[,meta$stage == "E8.5"]))
+
+tab = table(meta$sample[meta$stage == "E7.5"])
+
+#perform batch correction within each genotype, then across the genotypes
+correct1 = doBatchCorrect(counts = logcounts(scater::normalize(sce[hvgs_E7.5, meta$stage == "E7.5"])), 
+                          timepoints = meta$tomato[meta$stage == "E7.5"], 
+                          samples = meta$sample[meta$stage == "E7.5"], 
+                          timepoint_order = as.logical(c("TRUE", "FALSE")), 
+                          sample_order = as.numeric(names(tab[order(tab, decreasing = TRUE)])))
+
+```
+
+```{r mnncorrect-2}
+
+tab = table(meta$sample[meta$stage == "E8.5"])
+
+correct2 = doBatchCorrect(counts = logcounts(scater::normalize(sce[hvgs_E8.5, meta$stage == "E8.5"])), 
+                          timepoints = meta$tomato[meta$stage == "E8.5"], 
+                          samples = meta$sample[meta$stage == "E8.5"], 
+                          timepoint_order = as.logical(c("TRUE", "FALSE")), 
+                          sample_order = as.numeric(names(tab[order(tab, decreasing = TRUE)])))
+
+
+```
+
+```{r mnncorrect-join}
+
+corrected = list("E7.5" = correct1,
+                 "E8.5" = correct2)
+
+saveRDS(corrected, file = "/nfs/research1/marioni/jonny/chimera-t/data/corrected_pcas.rds")
+
+
+
+```
+
+A t-SNE visualisation of our cells, pre- and post-correction, is shown in Figure \@ref(fig:compare-all).
+
+```{r compare-all, fig.height = 10, fig.wide = TRUE, fig.cap = "t-SNE of cells before and after correction. Cells in red colours are Tomato+ (injected), cells in grey colours are Tomato- (embryo). Different shades of colour indicate difference samples."}
+
+base_7.5 = prcomp_irlba(t(logcounts(scater::normalize(sce[hvgs_E7.5, meta$stage == "E7.5"]))), n = nPC)$x
+base_8.5 = prcomp_irlba(t(logcounts(scater::normalize(sce[hvgs_E8.5, meta$stage == "E8.5"]))), n = nPC)$x
+
+tsne_pre_7.5 = Rtsne(base_7.5, pca = FALSE)$Y
+tsne_post_7.5 = Rtsne(corrected$E7.5, pca = FALSE)$Y
+
+tsne_pre_8.5 = Rtsne(base_8.5, pca = FALSE)$Y
+tsne_post_8.5 = Rtsne(corrected$E8.5, pca = FALSE)$Y
+
+ro1 = sample(nrow(base_7.5), nrow(base_7.5))
+ro2 = sample(nrow(base_8.5), nrow(base_8.5))
+
+p1 = ggplot(as.data.frame(tsne_pre_7.5)[ro1,], aes(x = V1, y = V2, col = factor(meta$sample[meta$stage == "E7.5"][ro1]))) +
+  geom_point(size = 0.4) +
+  scale_colour_manual(values = sample_colours, name = "Sample") +
+  theme(legend.position = "none",
+        axis.text = element_blank(),
+        axis.ticks = element_blank()) +
+  ggtitle("E7.5, pre-correction") +
+  labs(x= "tSNE1", y= "tSNE2")
+
+p2 = ggplot(as.data.frame(tsne_post_7.5)[ro1,], aes(x = V1, y = V2, col = factor(meta$sample[meta$stage == "E7.5"][ro1]))) +
+  geom_point(size = 0.4) +
+  scale_colour_manual(values = sample_colours, name = "Sample") +
+  theme(legend.position = "none",
+        axis.text = element_blank(),
+        axis.ticks = element_blank()) +
+  ggtitle("E7.5, post-correction") +
+  labs(x= "tSNE1", y= "tSNE2")
+
+p3 = ggplot(as.data.frame(tsne_pre_8.5)[ro2,], aes(x = V1, y = V2, col = factor(meta$sample[meta$stage == "E8.5"][ro2]))) +
+  geom_point(size = 0.4) +
+  scale_colour_manual(values = sample_colours, name = "Sample") +
+  theme(legend.position = "none",
+        axis.text = element_blank(),
+        axis.ticks = element_blank()) +
+  ggtitle("E8.5, pre-correction") +
+  labs(x= "tSNE1", y= "tSNE2")
+
+p4 = ggplot(as.data.frame(tsne_post_8.5)[ro2,], aes(x = V1, y = V2, col = factor(meta$sample[meta$stage == "E8.5"][ro2]))) +
+  geom_point(size = 0.4) +
+  scale_colour_manual(values = sample_colours, name = "Sample") +
+  theme(legend.position = "none",
+        axis.text = element_blank(),
+        axis.ticks = element_blank()) +
+  ggtitle("E8.5, post-correction") +
+  labs(x= "tSNE1", y= "tSNE2")
+
+plot_grid(p1, p2, p3, p4)
+
+```
+
+
+# Celltype-coloured tSNE
+
+Figure \@ref(fig:celltype) shows the same plots, but coloured by the mapped celltype (see the mapping script for details).
+
+```{r celltype, fig.wide = FALSE, fig.height=12, fig.cap = "t-SNEs, coloured by celltype."}
+
+
+tsne_7.5 = Rtsne(corrected[["E7.5"]], pca = FALSE)$Y
+tsne_8.5 = Rtsne(corrected[["E8.5"]], pca = FALSE)$Y
+
+ro1 = sample(sum(meta$stage == "E7.5"), sum(meta$stage == "E7.5"))
+ro2 = sample(sum(meta$stage == "E8.5"), sum(meta$stage == "E8.5"))
+
+plegend = ggplot(as.data.frame(tsne_7.5)[ro1,], aes(x = V1, y = V2, col = factor(meta$celltype.mapped[meta$stage == "E7.5"][ro1], levels = names(celltype_colours), ordered = TRUE))) +
+  geom_point() +
+  scale_colour_manual(values = celltype_colours, drop = FALSE, name = "") +
+  theme(axis.text = element_blank(),
+        axis.ticks = element_blank())  +
+  guides(col = guide_legend(override.aes = list(size = 5), ncol = 3))
+
+p1 = ggplot(as.data.frame(tsne_7.5)[ro1,], aes(x = V1, y = V2, col = factor(meta$celltype.mapped[meta$stage == "E7.5"][ro1], levels = names(celltype_colours), ordered = TRUE))) +
+  geom_point() +
+  scale_colour_manual(values = celltype_colours, name = "") +
+  theme(legend.position = "none",
+        axis.text = element_blank(),
+        axis.ticks = element_blank()) +
+  ggtitle("E7.5") +
+  labs(x = "tSNE1", y = "tSNE2")
+
+
+p2 = ggplot(as.data.frame(tsne_8.5)[ro2,], aes(x = V1, y = V2, col = factor(meta$celltype.mapped[meta$stage == "E8.5"][ro2], levels = names(celltype_colours), ordered = TRUE))) +
+  geom_point() +
+  scale_colour_manual(values = celltype_colours) +
+  theme(legend.position = "none",
+        axis.text = element_blank(),
+        axis.ticks = element_blank()) +
+  ggtitle("E8.5") +
+  labs(x = "tSNE1", y = "tSNE2")
+
+
+plot_grid(p1, get_legend(plegend), p2, ncol = 1, rel_heights = c(1,0.6,1))
+
+
+```
+
+# Celltype-coloured UMAP
+
+Finally, we generate UMAP coordinates of the batch-corrected data.
+
+```{r generate-umap}
+
+umap_7.5 = getUMAP(corrected[["E7.5"]])
+
+
+umap_8.5 = getUMAP(corrected[["E8.5"]])
+
+```
+
+```{r plot-umap, fig.height = 14, fig.wide = FALSE}
+
+p1 = ggplot(as.data.frame(umap_7.5)[ro1,], aes(x = V1, y = V2, col = factor(meta$celltype.mapped[meta$stage == "E7.5"][ro1], levels = names(celltype_colours), ordered = TRUE))) +
+  geom_point(size = 0.3) +
+  scale_colour_manual(values = celltype_colours) +
+  theme(legend.position = "none",
+        axis.text = element_blank(),
+        axis.ticks = element_blank()) +
+  ggtitle("E7.5") +
+  labs(x = "UMAP1", y = "UMAP2")
+
+
+p2 = ggplot(as.data.frame(umap_8.5)[ro2,], aes(x = V1, y = V2, col = factor(meta$celltype.mapped[meta$stage == "E8.5"][ro2], levels = names(celltype_colours), ordered = TRUE))) +
+  geom_point(size = 0.3) +
+  scale_colour_manual(values = celltype_colours) +
+  theme(legend.position = "none",
+        axis.text = element_blank(),
+        axis.ticks = element_blank()) +
+  ggtitle("E8.5") +
+  labs(x = "UMAP1", y = "UMAP2")
+
+plot_grid(p1, get_legend(plegend), p2, ncol = 1, rel_heights = c(1,0.6,1))
+
+ggsave(p1, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/batch_correct/umap_7.5.pdf",
+       width = 5, height = 5)
+ggsave(p2, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/batch_correct/umap_8.5.pdf",
+       width = 5, height = 5)
+
+saveRDS(list("E7.5" = umap_7.5,
+             "E8.5" = umap_8.5),
+        file = "/nfs/research1/marioni/jonny/chimera-t/data/umaps.rds")
+
+```
+
+And below, the cells are split by their Tomato status.
+
+```{r plot-umap-split, fig.height = 12, fig.wide = TRUE}
+
+meta$tomatoText = ifelse(meta$tomato, "Tom+", "Tom-")
+
+p1 = ggplot(data = meta[meta$stage == "E7.5",], 
+            mapping = aes(x = umap_7.5[ro1,1], 
+                          y = umap_7.5[ro1,2], 
+                          col = factor(celltype.mapped[ro1], 
+                                       levels = names(celltype_colours), 
+                                       ordered = TRUE))) +
+  geom_point(size = 0.3) +
+  scale_colour_manual(values = celltype_colours) +
+  theme(legend.position = "none",
+        axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        axis.title = element_blank()) +
+  ggtitle("E7.5") +
+  facet_wrap(~tomatoText[ro1])
+
+p2 = ggplot(data = meta[meta$stage == "E8.5",], 
+            mapping = aes(x = umap_8.5[ro2,1], 
+                          y = umap_8.5[ro2,2], 
+                          col = factor(celltype.mapped[ro2], 
+                                       levels = names(celltype_colours), 
+                                       ordered = TRUE))) +
+  geom_point(size = 0.3) +
+  scale_colour_manual(values = celltype_colours) +
+  theme(legend.position = "none",
+        axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        axis.title = element_blank()) +
+  ggtitle("E8.5") +
+  facet_wrap(~tomatoText[ro2])
+
+plot_grid(p1, p2, ncol = 1)
+
+ggsave(p1, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/batch_correct/umap_7.5_split.pdf",
+       width = 10, height = 5)
+ggsave(p2, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/batch_correct/umap_8.5_split.pdf",
+       width = 10, height = 5)
+
+
+```
+
+## Clone differences
+
+These chimeras contain two differenct clones of the T knockout (i.e., different disruptions of the T genes). These are shown in Figure \@ref(fig:clones) for all samples.
+
+
+```{r clones, fig.wide = TRUE, fig.height = 16, fig.cap = "Location of different clones in the UMAPs"}
+
+meta$clone = sapply(meta$sample,
+                    switch,
+                    "B6KO",
+                    "B6HOST",
+                    "B6KO",
+                    "B6HOST",
+                    "B6KO",
+                    "B6HOST",
+                    "B6KO",
+                    "B6HOST",
+                    "C6KO",
+                    "C6HOST",
+                    "B6KO",
+                    "B6HOST",
+                    "C6KO",
+                    "C6HOST",
+                    "C6KO",
+                    "C6HOST")
+
+meta_8.5= meta[meta$stage == "E8.5",]
+plots_8.5 = lapply(unique(meta_8.5$clone), function(x){
+  ggplot() +
+    geom_point(mapping = aes(x = umap_8.5[,1], 
+                             y = umap_8.5[,2]), 
+               col = "lightgrey") +
+    geom_point(mapping = aes(x = umap_8.5[meta_8.5$clone==x,1], 
+                             y = umap_8.5[meta_8.5$clone==x,2], 
+                             col = meta_8.5$celltype.mapped[meta_8.5$clone==x])) +
+    scale_color_manual(values = celltype_colours) +
+    theme(legend.position = "none",
+          axis.text = element_blank(),
+          axis.ticks = element_blank()) +
+    labs(x = "UMAP1", y = "UMAP2") +
+    ggtitle(paste0(x, " (E8.5)"))
+})
+
+meta_7.5= meta[meta$stage == "E7.5",]
+plots_7.5 = lapply(unique(meta_7.5$clone), function(x){
+  ggplot() +
+    geom_point(mapping = aes(x = umap_7.5[,1], 
+                             y = umap_7.5[,2]), 
+               col = "lightgrey") +
+    geom_point(mapping = aes(x = umap_7.5[meta_7.5$clone==x,1], 
+                             y = umap_7.5[meta_7.5$clone==x,2], 
+                             fill = meta_7.5$celltype.mapped[meta_7.5$clone==x]),
+    pch = 21, col = "black") +
+    scale_fill_manual(values = celltype_colours) +
+    theme(legend.position = "none",
+          axis.text = element_blank(),
+          axis.ticks = element_blank()) +
+    labs(x = "UMAP1", y = "UMAP2") +
+    ggtitle(paste0(x, " (E7.5)"))
+})
+
+grid = plot_grid(plotlist= c(plots_7.5, plots_8.5), ncol = 2)
+
+grid
+
+save_plot(grid, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/batch_correct/clone.pdf", base_width = 8, base_height = 16)
+
+```
+#Session Info
+```{r sessinf}
+sessionInfo()
+```

@@ -1,0 +1,1201 @@
+---
+title: "T chimera: Mapping to the atlas"
+author: "C. Guibentif, J. Griffiths et al. Chimera"
+output:
+  BiocStyle::html_document:
+    code_folding: hide
+    number_sections: yes
+    toc: yes  
+---
+
+#Introduction & method
+
+In this script we map cells from the Brachyury chimera onto our atlas dataset.
+
+```{r load, message = FALSE}
+library(Matrix)
+library(scran)
+library(scater)
+library(knitr)
+library(pheatmap)
+library(reshape2)
+library(edgeR)
+library(BiocNeighbors)
+
+source("/nfs/research1/marioni/jonny/embryos/scripts/core_functions.R")
+load_data()
+
+atlas_sce = sce
+atlas_meta = meta
+
+atlas_meta$celltype[atlas_meta$doublet] = "Doublet"
+atlas_meta$celltype[atlas_meta$stripped] = "Stripped"
+complete_atlas = atlas_sce
+complete_meta = atlas_meta
+
+full_85 = scater::normalize(atlas_sce[, atlas_meta$stage == "E8.5"])
+full_85_meta = atlas_meta[atlas_meta$stage == "E8.5",]
+
+#Downsample to 10k cells per sample (or maximum number of cells in sample)
+set.seed(42)
+keep = lapply(unique(atlas_meta$stage), function(x){
+  if(x == "mixed_gastrulation"){
+    return(c())
+  } else if(sum(atlas_meta$stage == x) < 10000) {
+    return(which(atlas_meta$stage == x))
+  } else {
+    hits = which(atlas_meta$stage == x)
+    return(sample(hits, 10000))
+  }
+})
+keep = do.call(c, keep)
+
+atlas_sce = scater::normalize(atlas_sce[,keep])
+atlas_meta = atlas_meta[keep,]
+
+source("/nfs/research1/marioni/jonny/chimera-t/scripts/core_functions.R")
+load_data()
+
+
+```
+
+To map, we consider batch-corrected PC coordinates. First, to mapping biases that may be driven by the presence of a different number of cells from each timepoint, we randomly downsampled the number of cells in the atlas at each timepoint to 10,000 cells, including doublets and stripped nuclei. Note that the E6.5 and E6.75 timepoints have fewer than 10,000 cells in total; for these timepoints, all cells were retained. However, given that the chimeras are from the E8.5 timepoint, it is unlikely that cells will map to these timepoints anyway.
+
+To remove batch-effects from the data that may compromise mapping, we first compute a shared set of 50 PCs including all cells from the atlas and all cells from the chimeras. Within this space, we then batch correct exclusively the atlas cells, using the same procedure as in the atlas processing itself, in order to provide an accurate and batch-effect free reference that exists within the same space as the chimera cells. We then map each of the chimera samples to this atlas separately, again using the same `fastMNN` approach. 
+
+For each cell in each chimera sample, we record the ten closest neighbours in the atlas data. We define the mapped celltype and mapped timepoint as the modal value of the atlas cells in these 10 neighbours. Where there is a tie for the modal celltype or timepoint, the mapped celltype or timepoint is decided by considering the closest cell in the atlas of the tied celltypes or timepoints.
+
+#Chimera mapping
+
+```{r map, warning = FALSE, message = FALSE}
+
+mappings = lapply(unique(meta$sample), function(x){
+  mapWrap(atlas_sce, atlas_meta, sce[-nrow(sce), meta$sample == x], meta[meta$sample == x,])
+})
+
+mappings = do.call(rbind, mappings)
+
+saveRDS(mappings, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/map/mapping_chimera.rds")
+
+
+mappings_list = lapply(unique(meta$sample), function(x){
+  mapWrap(atlas_sce, atlas_meta, sce[-nrow(sce), meta$sample == x], meta[meta$sample == x,], return.list = TRUE)
+})
+
+mappings_list = do.call(c, mappings_list)
+
+saveRDS(mappings_list, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/map/mapping_chimera_list.rds")
+
+mappings = readRDS("/nfs/research1/marioni/jonny/chimera-t/scripts/map/mapping_chimera.rds")
+
+meta$stage.mapped = as.character(mappings$stage.mapped[match(meta$cell, mappings$cell)])
+meta$celltype.mapped = as.character(mappings$celltype.mapped[match(meta$cell, mappings$cell)])
+meta$closest.cell = mappings$closest.cell[match(meta$cell, mappings$cell)]
+
+```
+
+
+##Mapping results
+
+To which stages do the WT-cells map? This is shown in Figure \@ref(fig:stage-mapping).
+
+```{r stage-mapping, fig.wide = TRUE, fig.height=8, fig.cap = "Mapping of cells to atlas timepoints. A: Mapping of cells from all chimeras to timepoints. B: Mapping of cells in the E7.5 chimeras, split by tomato status. C: Mapping of cells in the E8.5 chimeras, split by tomato status."}
+
+p1 = ggplot(mapping = aes(x = meta$stage.mapped, fill = meta$stage)) +
+  geom_bar(stat = "count", position = "dodge") +
+  scale_fill_manual(values=c("E8.5" = "dodgerblue", "E7.5" = "coral"), name = "Chimera\ntimepoint") +
+  labs(x = "Atlas stage", y = "# cells") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 0, vjust = 0.5)) +
+    scale_x_discrete(breaks = unique(meta$stage.mapped)[order(unique(meta$stage.mapped))], 
+                   drop = FALSE)
+  
+
+pdf1 = table(meta$stage.mapped[meta$stage == "E7.5"], meta$tomato[meta$stage == "E7.5"])
+pdf1 = as.data.frame(sweep(pdf1, 2, colSums(pdf1), "/"))
+
+p2 = ggplot(data = pdf1, mapping = aes(x = Var1, y = Freq, fill = Var2)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_fill_manual(values = c("TRUE" = "red", "FALSE" = "black"), 
+                    labels = c("TRUE" = "Tomato+", "FALSE" = "Tomato-"),
+                    name = "") +
+  labs(x = "Atlas stage", y = "Fraction of cells") +
+  ggtitle("E7.5 chimeras") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 0, vjust = 0.5)) +
+    scale_x_discrete(breaks = unique(meta$stage.mapped)[order(unique(meta$stage.mapped))], 
+                   drop = FALSE)
+
+
+pdf2 = table(meta$stage.mapped[meta$stage == "E8.5"], meta$tomato[meta$stage == "E8.5"])
+pdf2 = as.data.frame(sweep(pdf2, 2, colSums(pdf2), "/"))
+
+p3 = ggplot(data = pdf2, mapping = aes(x = Var1, y = Freq, fill = Var2)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_fill_manual(values = c("TRUE" = "red", "FALSE" = "black"), 
+                    labels = c("TRUE" = "Tomato+", "FALSE" = "Tomato-"),
+                    name = "") +
+  labs(x = "Atlas stage", y = "Fraction of cells") +
+  ggtitle("E8.5 chimeras") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 0, vjust = 0.5)) +
+    scale_x_discrete(breaks = unique(meta$stage.mapped)[order(unique(meta$stage.mapped))], 
+                   drop = FALSE)
+
+
+plot_grid(p1,p2,p3, labels = "AUTO")
+
+```
+
+Mapped timepoints are compared for each pool in Figure \@ref(fig:timepoints-pool).
+
+```{r timepoints-pool, fig.height = 8, fig.cap = "Timepoint mapping is shown split by embryo pool"}
+
+pl = lapply(unique(meta$stage), function(x){
+  sub_meta = meta[meta$stage == x,]
+  p = ggplot(
+    sub_meta, 
+    aes(
+      x = stage.mapped, 
+      y = ..prop.., 
+      fill = factor(pool),
+      group = factor(pool)
+      )
+    ) +
+    geom_bar(position = "dodge") +
+    scale_fill_brewer(palette = "Dark2", name = "Embryo\npool") +
+    labs(y = "Fraction of cells") +
+    theme(
+      axis.title.x = element_blank(),
+      axis.text.x = element_text(hjust = 1, vjust = 0.5, angle = 30)
+      ) +
+    ggtitle(sub_meta$stage[1])
+})
+
+plot_grid(plotlist = pl, ncol = 1)
+
+```
+ 
+Furthermore, to which celltypes do these cells contribute? This is shown in Figure \@ref(fig:celltype).
+
+```{r celltype, warning = FALSE, fig.wide = TRUE, fig.cap = "The fraction of cells mapping to each celltype from either genotype is shown, split by embryo pool.", fig.height = 16}
+
+pdfall = table(meta$celltype.mapped, meta$tomato)
+colnames(pdfall) = c("TomT", "TomF")[match(colnames(pdfall), c("TRUE", "FALSE"))]
+pdfall = sweep(pdfall, 2, colSums(pdfall), "/")
+pdfall = as.data.frame.matrix(pdfall)
+
+
+plegend = ggplot(data = pdfall, mapping = aes(x = TomT, y = TomF, col = rownames(pdfall))) +
+  geom_abline(slope = 1, intercept = 0) +
+  geom_point(size = 2) +
+  scale_colour_manual(values = c(celltype_colours, "Doublet" = "black", "Stripped" = "black"), name = "") +
+  labs(x = "Fraction of Tomato+ cells", y = "Fraction of Tomato- cells") +
+  ggtitle("all cells") +
+  scale_x_log10() +
+  scale_y_log10() +
+  guides(col = guide_legend(ncol = 4, override.aes = list(size = 5)))
+
+limmax = max(c(pdfall$TomF, pdfall$TomT))
+limmin = min(c(pdfall$TomF[pdfall$TomF != 0], pdfall$TomT[pdfall$TomT != 0]))
+
+p1 = ggplot(data = pdfall, mapping = aes(x = TomT, y = TomF, col = rownames(pdfall))) +
+  geom_abline(slope = 1, intercept = 0) +
+  geom_point(size = 2) +
+  scale_colour_manual(values = c(celltype_colours, "Doublet" = "black", "Stripped" = "black"), name = "") +
+  labs(x = "Tomato+ cells", y = "Tomato- cells") +
+  ggtitle("All cells") +
+scale_x_log10(breaks = c(0.1, 0.01, 0.001, 0.0001), labels = c("10%", "1%", "0.1%", "0.01%")) +
+  scale_y_log10(breaks = c(0.1, 0.01, 0.001, 0.0001), labels = c("10%", "1%", "0.1%", "0.01%")) +
+  theme(legend.position = "none") +
+  coord_fixed(xlim = c(limmax, limmin),
+              ylim = c(limmax, limmin))
+
+
+
+pool_plots = lapply(unique(meta$pool), function(x){
+	pdf = table(meta$celltype.mapped[meta$pool == x], meta$tomato[meta$pool == x])
+	colnames(pdf) = c("TomT", "TomF")[match(colnames(pdf), c("TRUE", "FALSE"))]
+	pdf = sweep(pdf, 2, colSums(pdf), "/")
+	pdf = as.data.frame.matrix(pdf)
+	limmax = max(c(pdf$TomF, pdf$TomT))
+	limmin = min(c(pdf$TomF[pdf$TomF != 0], pdf$TomT[pdf$TomT != 0]))
+	p = ggplot(data = pdf, mapping = aes(x = TomT, y = TomF, col = rownames(pdf))) +
+	  geom_abline(slope = 1, intercept = 0) +
+	  geom_point(size = 2) +
+	  scale_colour_manual(values = c(celltype_colours, "Doublet" = "black", "Stripped" = "black"), name = "") +
+	  labs(x = "Tomato+ cells", y = "Tomato- cells") +
+	  ggtitle(paste0("Pool ", x, ", ", meta$stage[meta$pool == x][1])) +
+	scale_x_log10(breaks = c(0.1, 0.01, 0.001, 0.0001), labels = c("10%", "1%", "0.1%", "0.01%")) +
+	  scale_y_log10(breaks = c(0.1, 0.01, 0.001, 0.0001), labels = c("10%", "1%", "0.1%", "0.01%")) +
+	  theme(legend.position = "none") +
+	  coord_fixed(xlim = c(limmax, limmin),
+	              ylim = c(limmax, limmin))
+
+	return(p)
+})
+
+p = plot_grid(plot_grid(plotlist = c(list(p1), pool_plots), ncol = 2), get_legend(plegend), rel_heights = c(0.8, 0.2), ncol = 1)
+
+p
+
+save_plot(p, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/map/celltype_scatterplot.pdf", base_width = 8, base_height =20)
+
+
+```
+
+There is clearly an aberration with the pool 2: it only has extraembryonic cells in the Tom- fraction. Further analysis is therefore excluded from this document, and from downstream analyses.
+
+
+```{r remove-pool2}
+sce = scater::normalize(sce[, meta$pool != 2])
+fullmeta = meta
+meta = meta[meta$pool != 2,]
+```
+
+## Mapping including the somite subclusters
+
+Here, we repeat the previous mapping step, but include the higher-resolution clustering used for the atlas somite trajectories.
+This provides us with a higher-resolution view of the data around these somitic celltypes.
+The celltype-level annotation provided above for consistency with our previously-generated chimaeras.
+We only map E8.5 cells from the chimaera to E8.5 cells in the atlas, in this case, as sub-celltypes are only defined for the E8.5 cells of the atlas.
+
+```{r}
+parax = read.table(
+  "/nfs/research1/marioni/jonny/chimera-t/scripts/somitogenesis/data/paraxialmeso_e85_annotation.txt", 
+  header = TRUE,
+  stringsAsFactors = FALSE)
+somit = read.table(
+  "/nfs/research1/marioni/jonny/chimera-t/scripts/somitogenesis/data/somiticmeso_e85_annotation.txt", 
+  header = TRUE,
+  stringsAsFactors = FALSE)
+both = rbind(parax, somit)
+both$celltype = gsub("_", " ", both$celltype)
+full_85_meta$celltype.old = full_85_meta$celltype
+full_85_meta[match(both$cell, full_85_meta$cell), "celltype"] = both$celltype
+# ref_meta$som_sub[match(both$cell, ref_meta$cell)] = both$celltype[match(both$cell, ref_meta$cell)]
+palette = c(celltype_colours, scales::brewer_pal(palette = "Dark2")(length(unique(both$celltype))))
+names(palette) = c(names(celltype_colours), unique(both$celltype))
+
+late_samples = unique(meta$sample[meta$stage == "E8.5"])
+keep_celltypes = c("Paraxial mesoderm", "Somitic mesoderm")
+#full_85 are the atlas E8.5 samples
+save(full_85, full_85_meta, sce, meta, file = "debug.RData")
+
+mappings_subct_85 = lapply(late_samples, function(x){
+  mapWrap(
+    full_85[, full_85_meta$celltype.old %in% keep_celltypes],
+    full_85_meta[full_85_meta$celltype.old %in% keep_celltypes,], 
+    sce[-nrow(sce), meta$sample == x & meta$celltype.mapped %in% keep_celltypes], 
+    meta[meta$sample == x & meta$celltype.mapped %in% keep_celltypes,])
+})
+
+mappings_subct_85 = do.call(rbind, mappings_subct_85)
+
+saveRDS(mappings_subct_85, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/map/mapping_chimera_subclusters.rds")
+
+meta$somite.subct.mapped = as.character(mappings_subct_85$celltype.mapped[match(meta$cell, mappings_subct_85$cell)])
+
+```
+
+## Mapping including the somite trajectories
+
+Here, we repeat the previous mapping step again, considering presence or absence of atlas cells from the somite trajectories that were considered in previous parts of the analysis for this paper.
+This may be useful to evaluate whether we observe differences of behaviour for T knockout cells at E7.5, than in the wild-type chimaeras.
+We only map E7.5 cells for this purpose, as trajectories for E8.5 cells are essentially determined by their sub-celltype mappings shown in the previous subsection of this document.
+
+```{r}
+membership = read.table("/nfs/research1/marioni/jonny/chimera-t/scripts/somitogenesis/trajectory_membership.tab",
+  sep = "\t", header = TRUE, stringsAsFactors = FALSE)
+
+atlas_meta2 = atlas_meta
+#deliberate NAs here
+atlas_meta2$celltype = membership$traj[match(atlas_meta2$cell, membership$cell)]
+atlas_meta2$celltype[is.na(atlas_meta2$celltype)] = "none"
+
+early_samples = unique(meta$sample[meta$stage == "E7.5"])
+
+mappings_traj = lapply(early_samples, function(x){
+  mapWrap(atlas_sce, atlas_meta2, sce[-nrow(sce), meta$sample == x], meta[meta$sample == x,])
+})
+
+mappings_traj = do.call(rbind, mappings_traj)
+
+saveRDS(mappings_traj, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/map/mapping_chimera_trajectories.rds")
+
+meta$trajectory.mapped = as.character(mappings_traj$celltype.mapped[match(meta$cell, mappings_traj$cell)])
+
+
+```
+
+## Differences in stage mapping by celltype
+
+It is possible that the injected population in the chimeras could mature at a slower speed than the host population.
+To test this, we summarised the mapped stage for each mapped cell type in each sample using the mean.
+In Figure \@ref(fig:ct-stage), the difference between the means for matched samples (i.e., from the same embryo) is shown.
+We further tested for significant differences between the paired mean-mapped-stages using t-tests; however, no significant differences were observed.
+Only cell types with at least 10 cells in each sample were retained for this analysis, for robustness.
+
+```{r ct-stage, fig.wide = TRUE, fig.height = 6, warning = FALSE, fig.cap = "Mean differences in mapped stage per celltype is shown. Only celltypes with at least 10 cells in each sample were retained. Each point is a different sample, the boxplots summarise the range of the results across samples."}
+
+
+
+make_delay_plot = function(logical_vec, metadata = meta, mincells = 10){
+  
+  meta_sub = metadata[logical_vec,]
+  meta_sub$celltype.mapped = as.character(meta_sub$celltype.mapped)
+
+
+  tab = table(meta_sub$celltype.mapped, meta_sub$sample)
+  cts = rownames(tab)[apply(tab, 1, min) > mincells]
+  meta_sub = meta_sub[meta_sub$celltype.mapped %in% cts, ]
+  
+  day = as.numeric(substr(as.character(meta_sub$stage.mapped), 2, nchar(as.character(meta_sub$stage.mapped))))
+  
+  #prepare a paired difference between pools
+  mean.day = aggregate(formula = day ~ meta_sub$celltype.mapped + meta_sub$sample, FUN = mean)
+  colnames(mean.day) = c("celltype", "sample", "day")
+  mean.day$tom = meta_sub$tomato[match(mean.day$sample, meta_sub$sample)]
+  mean.day$pool = meta_sub$pool[match(mean.day$sample, meta_sub$sample)]
+  out = sapply(unique(mean.day$celltype), function(x){
+    vec1 = sapply(unique(mean.day$pool), function(y){
+      mean.day$day[mean.day$celltype == x & mean.day$pool == y & mean.day$tom]
+    })
+    vec2 = sapply(unique(mean.day$pool), function(y){
+      mean.day$day[mean.day$celltype == x & mean.day$pool == y & !mean.day$tom]
+    })
+    return( (vec1 - vec2) * 24)
+  })
+  rownames(out) = paste("Pool", unique(mean.day$pool))
+  mlt = melt(out)
+  names(mlt) = c("pool", "celltype", "delay")
+  mlt$celltype = as.character(mlt$celltype)
+
+  
+  # mean.day = mean.day[mean.day$celltype %in% cts,]
+  # delta_mean = sapply(cts, function(x) mean.day$day[mean.day$celltype == x][1] - mean.day$day[mean.day$celltype == x][2])
+  # delta_mean = delta_mean * 24
+  # names(delta_mean) = cts
+  
+  if(length(unique(meta_sub$pool))>1){
+    tests = testDevelopmentalDelayTTest(meta_sub)
+    sig = p.adjust(tests, method ="fdr") < 0.1
+    annot = data.frame(celltype = names(tests)[sig], 
+                       ypos = switch(any(sig) + 1, 
+                                     numeric(), 
+                                     max(mlt$delay * 1.1)))
+  } else {
+    annot = data.frame(celltype = character(), 
+                       ypos = numeric())
+  }
+  
+  p = ggplot(data = mlt, mapping = aes(x = celltype, y = delay, col = pool)) +
+    geom_hline(yintercept  = 0, col = "darkgrey") +
+    geom_boxplot(inherit.aes = FALSE, mapping = aes(x = celltype, y = delay), outlier.shape = NA) +
+    geom_jitter(height = 0, width = 0.2, size = 1.5) +
+    scale_color_brewer(palette = "Dark2", name= "") +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5), axis.title.x = element_blank()) +
+    labs(y = "Mutant delay (hours)") +
+    geom_text(data = annot, mapping = aes(x = celltype, y = ypos, label = rep("*", nrow(annot))), inherit.aes = FALSE, size = 8) +
+    guides(col = guide_legend(override.aes = list(size = 3)))
+
+  
+  return(p)
+}
+
+delay_8.5 = make_delay_plot(meta$stage == "E8.5" & !meta$celltype.mapped %in% c("Doublet", "Stripped")) + ggtitle("E8.5")
+delay_7.5 = make_delay_plot(meta$stage == "E7.5" & !meta$celltype.mapped %in% c("Doublet", "Stripped")) + ggtitle("E7.5")
+
+plot_grid(delay_8.5, delay_7.5)
+
+ggsave(delay_8.5 + theme(legend.position = c(0.7, 0.97)), file = "/nfs/research1/marioni/jonny/chimera-t/scripts/map/plots/delay_8.5.pdf", width = 6, height = 5)
+
+ggsave(delay_7.5 + theme(legend.position = c(0.7, 0.97)), file = "/nfs/research1/marioni/jonny/chimera-t/scripts/map/plots/delay_7.5.pdf", width = 6, height = 5)
+
+```
+
+## Differential abundance
+
+To test differential abundance of celltypes, we can leverage the wild-type chimeras to ensure that we do not capture any general effects that derive from the formation of a chimera.
+In other words, we avoid testing between the host and injected samples of a particular chimera in case there is any universal chimera-specific effect that is not induced by the T mutation.
+
+Specifically, we fit a linear model for each cell-type (using edgeR) that considers cell-type counts from the wild-type and T chimera samples. In this linear model, we include an intercept universal to all samples, a term for the experimental batch (i.e. embryo pool) and an interaction term between the experiment type (i.e., WT or KO) and whether a sample is of host cells (Tom-) or injected cells (Tom+) (terms for the host cells are excluded to make the design matrix full rank).
+
+We then test the contrast between the Injected KO term and the Injected WT term, which tell us whether we are seeing a greater deviation in celltype abundance than we would expect from the WT chimeras. This approach allows us to leverage experimental replication effectively in both the WT and T chimeras. Results for the test, and estimated fold-changes, are shown in Figure \@ref(fig:d-abundance). This is shown here for E8.5, for simplicity. E7.5 plots can be found below, in Figure \@ref(fig:d-abundance-75).
+
+```{r d-abundance, fig.wide = TRUE, fig.height = 8, fig.cap = "Differential abundance testing results, considering T and WT chimeras. Asterisks indicate significant differential abundance (BH-adjusted p < 0.1)"}
+
+meta_wt = read.table("/nfs/research1/marioni/jonny/chimera-wt/data/meta.tab", sep = "\t", stringsAsFactors = FALSE, header = TRUE)
+
+dabun_85 = testDifferentialAbundance(meta[meta$stage == "E8.5" & 
+                                         !meta$celltype.mapped %in% c("Doublet",
+                                                                      "Stripped"),],
+                                  meta_wt[meta_wt$stage == "E8.5" & 
+                                         !meta_wt$celltype.mapped %in% c("Doublet",
+                                                                      "Stripped"),]
+                                  )
+write.table(dabun_85, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/map/dabun_85.tab", sep = "\t", col.names = TRUE, row.names = TRUE, quote = FALSE)
+
+
+
+
+sig = dabun_85[dabun_85$FDR < 0.1,]
+sig$ypos = sig$logFC + 0.3 * sign(sig$logFC)
+
+p = ggplot(dabun_85, mapping = aes(x = rownames(dabun_85), y = logFC, fill = rownames(dabun_85))) +
+  geom_bar(stat = "identity", col = "black") +
+  scale_fill_manual(values = celltype_colours) +
+  theme(legend.position = "none",
+        axis.title.x =  element_blank(),
+        axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) +
+  labs(y = "log2FC (injected T-KO vs\ninjected WT)") +
+  geom_text(data = sig, mapping = aes(y = ypos, x = rownames(sig)), inherit.aes = FALSE, label = "*", size = 6, nudge_y = -0.1) +
+  ggtitle("E8.5 differential abundance")
+
+p
+
+ggsave(p, file ="/nfs/research1/marioni/jonny/chimera-t/scripts/map/dabun_85.pdf", width = 8, height = 6)
+
+```
+
+By contrast, we can perform a similar differential abundance test, but only using the T-knockout chimeras.
+The model and procedure is very similar to what is described above, except that the model matrix contains only the embryo pool and injected status for each sample, and of course we only include the T chimera samples.
+We also only test for differences between the injected and host populations in the T chimera.
+We also exclude extraembryonic tissues, which would otherwise induce large compositional effects.
+The results are shown in Figure \@ref(fig:dabun-within) - note the signal in e.g. cardiomyocytes that is ablated when including the WT chimeras.
+
+```{r dabun-within, fig.wide = TRUE, fig.height = 8, fig.cap = "Differential abundance testing results, considering T and WT chimeras. Asterisks indicate significant differential abundance (BH-adjusted p < 0.1)"}
+
+dabun_within = testDifferentialAbundanceWithin(meta[meta$stage == "E8.5",])
+
+sig_within = dabun_within[dabun_within$FDR < 0.1,]
+sig_within$ypos = sig_within$logFC  + 0.5 * sign(sig_within$logFC)
+
+p1 = ggplot(dabun_within, mapping = aes(x = rownames(dabun_within), y = logFC, fill = rownames(dabun_within))) +
+  geom_bar(stat = "identity", col = "black") +
+  scale_fill_manual(values = celltype_colours) +
+  theme(legend.position = "none",
+        axis.title.x =  element_blank(),
+        axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) +
+  labs(y = "log2FC\n(Injected vs Host)") +
+  geom_text(data = sig_within, mapping = aes(y = ypos, x = rownames(sig_within)), inherit.aes = FALSE, label = "*", size = 6, nudge_y = -0.2) +
+  ggtitle("E8.5 differential abundance, within T chimeras")
+
+p1
+
+ggsave(p1, file ="/nfs/research1/marioni/jonny/chimera-t/scripts/map/dabun_within_85.pdf", width = 8, height = 6)
+
+grid = plot_grid(p, p1, 
+                 ncol = 1,
+                 labels = "auto")
+save_plot(grid, file ="/nfs/research1/marioni/jonny/chimera-t/scripts/map/dabun_grid_85.pdf", base_width = 6, base_height = 10 )
+
+```
+
+The E7.5 differential abundance results are shown in Figure \@ref(fig:d-abundance-75).
+
+```{r d-abundance-75, fig.wide = TRUE, fig.height = 8, fig.cap = "Differential abundance testing results, considering T and WT chimeras. Asterisks indicate significant differential abundance (BH-adjusted p < 0.1)"}
+
+dabun_75 = testDifferentialAbundance(meta[meta$stage == "E7.5" & 
+                                         !meta$celltype.mapped %in% c("Doublet",
+                                                                      "Stripped"),],
+                                  meta_wt[meta_wt$stage == "E7.5" & 
+                                         !meta_wt$celltype.mapped %in% c("Doublet",
+                                                                      "Stripped"),]
+                                  )
+write.table(dabun_75, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/map/dabun_75.tab", sep = "\t", col.names = TRUE, row.names = TRUE, quote = FALSE)
+
+sig = dabun_75[dabun_75$FDR < 0.1,]
+sig$ypos = sig$logFC  + 0.5 * sign(sig$logFC)
+
+p = ggplot(dabun_75, mapping = aes(x = rownames(dabun_75), y = logFC, fill = rownames(dabun_75))) +
+  geom_bar(stat = "identity", col = "black") +
+  scale_fill_manual(values = celltype_colours) +
+  theme(legend.position = "none",
+        axis.title.x =  element_blank(),
+        axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) +
+  labs(y = "log2FC (injected T-KO vs\ninjected WT)") +
+  geom_text(data = sig, mapping = aes(y = ypos, x = rownames(sig)), inherit.aes = FALSE, label = "*", size = 6, nudge_y = -0.2) +
+  ggtitle("E7.5 differential abundance")
+
+p
+
+ggsave(p, file ="/nfs/research1/marioni/jonny/chimera-t/scripts/map/dabun_75.pdf", width = 8, height = 6)
+
+```
+
+### Somite subcluster differential abundance - E8.5
+
+```{r d-abundance-som, fig.wide = TRUE, fig.height = 8, fig.cap = "Differential abundance testing results, considering T and WT chimeras, for the somite subclusters"}
+
+meta_wt = read.table("/nfs/research1/marioni/jonny/chimera-wt/data/meta.tab", sep = "\t", stringsAsFactors = FALSE, header = TRUE)
+
+dabun_85 = testDifferentialAbundance(meta[meta$stage == "E8.5" & 
+                                         !meta$celltype.mapped %in% c("Doublet",
+                                                                      "Stripped"),],
+                                  meta_wt[meta_wt$stage == "E8.5" & 
+                                         !meta_wt$celltype.mapped %in% c("Doublet",
+                                                                      "Stripped"),]
+                                  )
+write.table(dabun_85, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/map/dabun_85.tab", sep = "\t", col.names = TRUE, row.names = TRUE, quote = FALSE)
+
+
+
+
+sig = dabun_85[dabun_85$FDR < 0.1,]
+sig$ypos = sig$logFC + 0.3 * sign(sig$logFC)
+
+p = ggplot(dabun_85, mapping = aes(x = rownames(dabun_85), y = logFC, fill = rownames(dabun_85))) +
+  geom_bar(stat = "identity", col = "black") +
+  scale_fill_manual(values = celltype_colours) +
+  theme(legend.position = "none",
+        axis.title.x =  element_blank(),
+        axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) +
+  labs(y = "log2FC (injected T-KO vs\ninjected WT)") +
+  geom_text(data = sig, mapping = aes(y = ypos, x = rownames(sig)), inherit.aes = FALSE, label = "*", size = 6, nudge_y = -0.1) +
+  ggtitle("E8.5 differential abundance")
+
+p
+
+ggsave(p, file ="/nfs/research1/marioni/jonny/chimera-t/scripts/map/dabun_85.pdf", width = 8, height = 6)
+
+```
+
+### Trajectory differential abundance - E7.5
+
+```{r}
+
+dummy_t = meta
+dummy_wt = meta_wt
+save(dummy_t, dummy_wt, file = "/nfs/research1/marioni/jonny/dummy_dfs.RData")
+
+banned = c("Doublet", "Stripped", "Parietal endoderm", "ExE endoderm", "ExE ectoderm", "Visceral endoderm")
+
+dummy_t = dummy_t[
+    !dummy_t$celltype.mapped %in% banned &
+    dummy_t$stage == "E7.5" &
+    dummy_t$pool != 2,]
+if(2 %in% dummy_t$pool)
+  stop("Pool 2 is still in the T meta")
+dummy_wt = dummy_wt[
+    !dummy_wt$celltype.mapped %in% banned & 
+    dummy_wt$stage == "E7.5",]
+
+#redefine these for dabun call
+# dummy_t$celltype.mapped = dummy_t$celltype = dummy_t$trajectory.mapped
+# dummy_wt$celltype.mapped = dummy_wt$celltype = dummy_wt$trajectory.mapped
+# Formal dabun testing will not work on account of #df
+# traj_abun = testDifferentialAbundance(dummy_t, dummy_wt)
+
+df = data.frame(
+  traj = c(dummy_t$trajectory.mapped, dummy_wt$trajectory.mapped),
+  sample = c(paste0(dummy_t$sample, "KO"), paste0(dummy_wt$sample, "WT")),
+  expt = c(rep("T", nrow(dummy_t)), rep("WT", nrow(dummy_wt)))
+  )
+tab = table(df$traj, df$sample)
+
+make_table_for_glm = function(row, table = tab){
+  df = data.frame(
+    isKO = c(rep(TRUE, 3), FALSE, FALSE),
+    num_cells = table[row, seq(1,9,2)],
+    total = colSums(table)[seq(1,9,2)],
+    row = row
+  )
+  df$frac_cells = df$num_cells/df$total
+  return(df)
+}
+
+ant_tab = make_table_for_glm("ant")
+ant_glm = glm(data = ant_tab, formula = frac_cells ~ 0 + isKO, weights = total, family = "binomial")
+
+post_tab = make_table_for_glm("post")
+post_glm = glm(data = post_tab, formula = frac_cells ~ isKO, weights = total, family = "binomial")
+
+nmp_tab = make_table_for_glm("nmp")
+nmp_glm = glm(data = nmp_tab, formula = frac_cells ~ isKO, weights = total, family = "binomial")
+
+big_tab = rbind(ant_tab, post_tab, nmp_tab)
+big_tab$test_names = paste(row, isKO)
+big_tab$sample = rep(rownames(ant_tab), 3)
+mm = model.matrix(data = big_tab, ~ 0 + sample + row + row:isKO)
+big_glm = glm(data = big_tab, formula = frac_cells ~ 0 + sample + row + row:isKO, weights = total, family = "binomial")
+
+
+df_ct = data.frame(
+  ct = c(dummy_t$celltype.mapped, dummy_wt$celltype.mapped),
+  sample = c(paste0(dummy_t$sample, "KO"), paste0(dummy_wt$sample, "WT")),
+  expt = c(rep("T", nrow(dummy_t)), rep("WT", nrow(dummy_wt)))
+  )
+tab_ct = table(df_ct$ct, df_ct$sample)
+tab_ct = tab_ct[apply(tab_ct, 1, max) > 9,]
+celltype_dfs = lapply(rownames(tab_ct), make_table_for_glm, table = tab_ct)
+celltype_tests = lapply(celltype_dfs, function(x){
+  glm(data = x, formula = frac_cells ~ isKO, weights = total, family = "binomial")
+    })
+output = do.call(rbind, 
+  lapply(1:length(celltype_tests), function(x){
+  sum = summary(celltype_tests[[x]])
+  return(
+    data.frame(ct = rownames(tab_ct)[x], coef = coef(sum)[2,1], p = coef(sum)[2,4])
+  )
+}))
+output$sig = p.adjust(output$p, method = "fdr") < 0.1
+# early_abun = testDifferentialAbundance(dummy_t, dummy_wt)
+
+bootstrap_table = function(table, ct1 = "nmp", ct2 = "post"){
+    table_sub = table[c(ct1, ct2),]
+    samples = sapply(1:ncol(table_sub), function(x){
+      table(sample(rownames(table_sub), size = colSums(table_sub)[x], replace = TRUE))
+    })
+    colnames(samples) = colnames(table_sub)
+    ratios = samples[ct1,]/samples[ct2,]
+    return(ratios)
+}
+
+
+
+get_bootstrapped_values = function(table, ct1, ct2, n = 10000, seed = 42){
+  set.seed(seed)
+  bs = lapply(1:n, function(x) bootstrap_table(tab[,seq(1, ncol(tab), 2)], ct1, ct2))
+  ts = sapply(bs, function(x) t.test(x[grepl("KO", names(x))], x[!grepl("KO", names(x))])$statistic)
+
+  our_ratios = (tab[ct1,]/tab[ct2,])[seq(1, ncol(tab), 2)]
+  our_t = t.test(
+    our_ratios[grepl("KO", names(our_ratios))],
+    our_ratios[!grepl("KO", names(our_ratios))]
+  )$statistic
+  return(list(t = our_t, bootstraps = ts))
+}
+
+print("p for nmp/post")
+bs_nmp_post = get_bootstrapped_values(table, "nmp", "post")
+print(sum(bs_nmp_post$bootstraps > bs_nmp_post$t)/length(bs_nmp_post$bootstraps))
+
+print("p for ant/post")
+bs_ant_post = get_bootstrapped_values(table, "ant", "post")
+print(sum(bs_ant_post$bootstraps > bs_ant_post$t)/length(bs_ant_post$bootstraps))
+
+get_bootstrapped_values_pools = function(table, ct1, ct2, n = 10000, seed = 42){
+  set.seed(seed)
+  bs = lapply(1:n, function(x) bootstrap_table(tab, ct1, ct2))
+  pool_ratios = lapply(bs, function(x) x[seq(1,length(x),2)]/x[seq(2,length(x),2)])
+  ts = sapply(pool_ratios, function(x) t.test(x[grepl("KO", names(x))], x[!grepl("KO", names(x))])$statistic)
+
+  our_ratios = (
+    (tab[ct1, seq(1, ncol(tab), 2)]/tab[ct1, seq(2, ncol(tab), 2)]) /
+    (tab[ct2, seq(1, ncol(tab), 2)]/tab[ct2, seq(2, ncol(tab), 2)]) )
+  our_t = t.test(
+    our_ratios[grepl("KO", names(our_ratios))],
+    our_ratios[!grepl("KO", names(our_ratios))]
+  )$statistic
+  return(list(t = our_t, bootstraps = ts))
+}
+
+print("p for nmp/post")
+bs_nmp_post = get_bootstrapped_values_pools(table, "nmp", "post")
+print(sum(bs_nmp_post$bootstraps > bs_nmp_post$t)/length(bs_nmp_post$bootstraps))
+
+print("p for ant/post")
+bs_ant_post = get_bootstrapped_values_pools(table, "ant", "post")
+print(sum(bs_ant_post$bootstraps > bs_ant_post$t)/length(bs_ant_post$bootstraps))
+
+#nmp vs post
+ratio = tab["nmp",]/tab["post",]
+ratio_pool = ratio[seq(1, 9, 2)]/ratio[seq(2, 10, 2)]
+
+p = ggplot(mapping = aes(x = grepl("WT", names(ratio_pool)), y = ratio_pool)) +
+  geom_jitter(height = 0, width = 0.1) +
+  scale_x_discrete(labels = c("TRUE" = "WT\nchimeras", "FALSE" = "T\nchimeras")) +
+  theme(axis.title.x = element_blank()) +
+  labs(y = "Relative ratio (NMP ratio/Post. ratio)") +
+  ggtitle("E7.5")
+
+ggsave(p, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/map/ratio_nmp_post_poolnormalised.pdf", width = 2.5, height = 4)
+
+ratio = tab["nmp",]/tab["post",]
+ratio_pool = ratio[seq(1,length(ratio),2)]
+
+p = ggplot(mapping = aes(x = grepl("WT", names(ratio_pool)), y = ratio_pool)) +
+  geom_jitter(height = 0, width = 0.1) +
+  scale_x_discrete(labels = c("TRUE" = "WT\nchimeras", "FALSE" = "T\nchimeras")) +
+  theme(axis.title.x = element_blank()) +
+  labs(y = "NMP cells/Post. cells") +
+  ggtitle("E7.5")
+
+ggsave(p, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/map/ratio_nmp_post_direct.pdf", width = 2.5, height = 4)
+
+#ant vs post
+ratio = tab["ant",]/tab["post",]
+ratio_pool = ratio[seq(1, 9, 2)]/ratio[seq(2, 10, 2)]
+
+p = ggplot(mapping = aes(x = grepl("WT", names(ratio_pool)), y = ratio_pool)) +
+  geom_jitter(height = 0, width = 0.1) +
+  scale_x_discrete(labels = c("TRUE" = "WT\nchimeras", "FALSE" = "T\nchimeras")) +
+  theme(axis.title.x = element_blank()) +
+  labs(y = "Relative ratio (Ant. ratio/Post. ratio)") +
+  ggtitle("E7.5")
+
+ggsave(p, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/map/ratio_ant_post_poolnormalised.pdf", width = 2.5, height = 4)
+
+ratio = tab["ant",]/tab["post",]
+ratio_pool = ratio[seq(1,length(ratio),2)]
+
+p = ggplot(mapping = aes(x = grepl("WT", names(ratio_pool)), y = ratio_pool)) +
+  geom_jitter(height = 0, width = 0.1) +
+  scale_x_discrete(labels = c("TRUE" = "WT\nchimeras", "FALSE" = "T\nchimeras")) +
+  theme(axis.title.x = element_blank()) +
+  labs(y = "Ant. cells/Post. cells") +
+  ggtitle("E7.5")
+
+ggsave(p, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/map/ratio_ant_post_direct.pdf", width = 2.5, height = 4)
+
+
+t_balance = t.test(ratio_pool-1)
+t_across = t.test(ratio_pool[1:3], ratio_pool[4:5])
+
+ind = seq(1,9,2)
+ratio_c_ant = tab["ant",ind]/(tab["ant",ind] + tab["ant",ind+1])
+ratio_c_post = tab["post",ind]/(tab["post",ind] + tab["post",ind+1])
+ratio_c_nmp = tab["nmp",ind]/(tab["nmp",ind] + tab["nmp",ind+1])
+
+pdf = data.frame(
+  frac = c(ratio_c_ant, ratio_c_post, ratio_c_nmp), 
+  expt = c(
+    rep("T", sum(grepl("KO", names(ratio_c_ant)))),
+    rep("WT", sum(grepl("WT", names(ratio_c_ant)))),
+    rep("T", sum(grepl("KO", names(ratio_c_post)))),
+    rep("WT", sum(grepl("WT", names(ratio_c_post)))),
+    rep("T", sum(grepl("KO", names(ratio_c_post)))),
+    rep("WT", sum(grepl("WT", names(ratio_c_post))))), 
+  traj = c(
+    rep("Anterior\nsomites", length(ratio_c_ant)),
+    rep("Posteriors\nsomites", length(ratio_c_post)),
+    rep("NMP", length(ratio_c_nmp)))
+    )
+
+p = ggplot(pdf, aes(x = traj, y = frac, group = expt, col = expt)) +
+  geom_jitter(height = 0, width = 0.1) +
+  labs(x = "Trajectory", y = "Fraction of cells in trajectory that are Tom+") +
+  ggtitle("E7.5")
+
+ggsave(p, file = "plots/carolina_fraction_plots.pdf", width = 6, height = 6)
+
+```
+
+### Trajectory differential expression - E7.5
+
+```{r}
+
+traj_sce = sce[, meta$trajectory.mapped %in% c("ant", "post", "nmp")]
+traj_meta = meta[meta$trajectory.mapped %in% c("ant", "post", "nmp"), ]
+
+de_t_ant = findMarkers(
+  scater::normalize(traj_sce[, traj_meta$trajectory == "ant"]),
+  clusters = traj_meta$tomato[traj_meta$trajectory == "ant"])
+
+de_t_post = findMarkers(
+  scater::normalize(traj_sce[, traj_meta$trajectory == "post"]),
+  clusters = traj_meta$tomato[traj_meta$trajectory == "post"])
+
+de_t_nmp = findMarkers(
+  scater::normalize(traj_sce[, traj_meta$trajectory == "nmp"]),
+  clusters = traj_meta$tomato[traj_meta$trajectory == "nmp"])
+
+de_t_ant[[1]]$mgi = get_mgi(rownames(de_t_ant[[1]]))
+de_t_post[[1]]$mgi = get_mgi(rownames(de_t_post[[1]]))
+de_t_nmp[[1]]$mgi = get_mgi(rownames(de_t_nmp[[1]]))
+
+write.table(de_t_ant[[1]], file = "tomato_de_anteriorsom_E7.5_t.csv",
+  sep = ",", col.names = TRUE, quote = FALSE, row.names = TRUE)
+write.table(de_t_post[[1]], file = "tomato_de_posteriorsom_E7.5_t.csv",
+  sep = ",", col.names = TRUE, quote = FALSE, row.names = TRUE)
+write.table(de_t_nmp[[1]], file = "tomato_de_nmp_E7.5_t.csv",
+  sep = ",", col.names = TRUE, quote = FALSE, row.names = TRUE)
+
+
+```
+
+## Testing NMP/post/ant biases
+
+```{r}
+
+dummy_t = meta
+dummy_wt = meta_wt
+save(dummy_t, dummy_wt, file = "/nfs/research1/marioni/jonny/dummy_dfs.RData")
+
+banned = c("Doublet", "Stripped", "Parietal endoderm", "ExE endoderm", "ExE ectoderm", "Visceral endoderm")
+
+dummy_t = dummy_t[
+    !dummy_t$celltype.mapped %in% banned &
+    dummy_t$stage == "E8.5" &
+    dummy_t$pool != 2,]
+if(2 %in% dummy_t$pool)
+  stop("Pool 2 is still in the T meta")
+dummy_wt = dummy_wt[
+    !dummy_wt$celltype.mapped %in% banned & 
+    dummy_wt$stage == "E8.5",]
+
+df = data.frame(
+  ct = c(dummy_t$celltype.mapped, dummy_wt$celltype.mapped),
+  sample = c(paste0(dummy_t$sample, "KO"), paste0(dummy_wt$sample, "WT")),
+  expt = c(rep("T", nrow(dummy_t)), rep("WT", nrow(dummy_wt))),
+  stringsAsFactors = FALSE
+  )
+tab = table(df$ct, df$sample)
+#critical MUST be ordered like this
+tab = tab[, unique(df$sample)]
+
+bootstrap_table = function(table, ct1 = "nmp", ct2 = "post"){
+    table_sub = table[c(ct1, ct2),]
+    samples = sapply(1:ncol(table_sub), function(x){
+      table(sample(rownames(table_sub), size = colSums(table_sub)[x], replace = TRUE))
+    })
+    colnames(samples) = colnames(table_sub)
+    ratios = samples[ct1,]/samples[ct2,]
+    return(ratios)
+}
+
+get_bootstrapped_values = function(table, ct1, ct2, n = 10000, seed = 42){
+  set.seed(seed)
+  bs = lapply(1:n, function(x) bootstrap_table(table[,seq(1, ncol(table), 2)], ct1, ct2))
+  ts = sapply(bs, function(x) t.test(x[grepl("KO", names(x))], x[!grepl("KO", names(x))])$statistic)
+
+  our_ratios = (table[ct1,]/table[ct2,])[seq(1, ncol(table), 2)]
+  our_t = t.test(
+    our_ratios[grepl("KO", names(our_ratios))],
+    our_ratios[!grepl("KO", names(our_ratios))]
+  )$statistic
+  return(list(t = our_t, bootstraps = ts))
+}
+
+print("p for nmp/post")
+bs_nmp_post = get_bootstrapped_values(tab, "NMP", "Somitic mesoderm", seed = 420)#set at 420 to avoid a div0 error at seed 42
+print(sum(bs_nmp_post$bootstraps > bs_nmp_post$t)/length(bs_nmp_post$bootstraps))
+
+print("p for ant/post")
+bs_ant_post = get_bootstrapped_values(tab, "Paraxial mesoderm", "Somitic mesoderm")
+print(sum(bs_ant_post$bootstraps > bs_ant_post$t)/length(bs_ant_post$bootstraps))
+
+get_bootstrapped_values_pools = function(table, ct1, ct2, n = 10000, seed = 42){
+  set.seed(seed)
+  bs = lapply(1:n, function(x) bootstrap_table(tab, ct1, ct2))
+  pool_ratios = lapply(bs, function(x) x[seq(1,length(x),2)]/x[seq(2,length(x),2)])
+  ts = sapply(pool_ratios, function(x) t.test(x[grepl("KO", names(x))], x[!grepl("KO", names(x))])$statistic)
+
+  our_ratios = (
+    (tab[ct1, seq(1, ncol(tab), 2)]/tab[ct1, seq(2, ncol(tab), 2)]) /
+    (tab[ct2, seq(1, ncol(tab), 2)]/tab[ct2, seq(2, ncol(tab), 2)]) )
+  our_t = t.test(
+    our_ratios[grepl("KO", names(our_ratios))],
+    our_ratios[!grepl("KO", names(our_ratios))]
+  )$statistic
+  return(list(t = our_t, bootstraps = ts))
+}
+
+print("p for nmp/post")
+bs_nmp_post = get_bootstrapped_values_pools(table, "NMP", "Somitic mesoderm")
+print(sum(bs_nmp_post$bootstraps > bs_nmp_post$t)/length(bs_nmp_post$bootstraps))
+
+print("p for ant/post")
+bs_ant_post = get_bootstrapped_values_pools(table, "Paraxial mesoderm", "Somitic mesoderm")
+print(sum(bs_ant_post$bootstraps > bs_ant_post$t)/length(bs_ant_post$bootstraps))
+
+#nmp vs post
+ratio = tab["NMP",]/tab["Somitic mesoderm",]
+ratio_pool = ratio[seq(1,length(ratio),2)]/ratio[seq(2,length(ratio),2)]
+
+p = ggplot(mapping = aes(x = grepl("WT", names(ratio_pool)), y = ratio_pool)) +
+  geom_jitter(height = 0, width = 0.1) +
+  scale_x_discrete(labels = c("TRUE" = "WT\nchimeras", "FALSE" = "T\nchimeras")) +
+  theme(axis.title.x = element_blank()) +
+  labs(y = "Relative ratio (NMP ratio/Post. ratio)") +
+  ggtitle("E8.5") +
+  scale_y_continuous(breaks = c(1, 5, 10, 20, 30))
+
+ggsave(p, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/map/ratio_E8.5_nmp_post_poolnormalised.pdf", width = 2.5, height = 4)
+
+ratio = tab["NMP",]/tab["Somitic mesoderm",]
+ratio_pool = ratio[seq(1,length(ratio),2)]
+
+p = ggplot(mapping = aes(x = grepl("WT", names(ratio_pool)), y = ratio_pool)) +
+  geom_jitter(height = 0, width = 0.1) +
+  scale_x_discrete(labels = c("TRUE" = "WT\nchimeras", "FALSE" = "T\nchimeras")) +
+  theme(axis.title.x = element_blank()) +
+  labs(y = "NMP cells/Post. cells") +
+  ggtitle("E8.5") +
+  scale_y_continuous(breaks = c(1, 5, 10, 20, 30))
+
+ggsave(p, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/map/ratio_E8.5_nmp_post_direct.pdf", width = 2.5, height = 4)
+
+#ant vs post
+ratio = tab["Paraxial mesoderm",]/tab["Somitic mesoderm",]
+ratio_pool = ratio[seq(1,length(ratio),2)]/ratio[seq(2,length(ratio),2)]
+
+p = ggplot(mapping = aes(x = grepl("WT", names(ratio_pool)), y = ratio_pool)) +
+  geom_jitter(height = 0, width = 0.1) +
+  scale_x_discrete(labels = c("TRUE" = "WT\nchimeras", "FALSE" = "T\nchimeras")) +
+  theme(axis.title.x = element_blank()) +
+  labs(y = "Relative ratio (Ant. ratio/Post. ratio)") +
+  ggtitle("E8.5") +
+  scale_y_continuous(breaks = c(1, 5, 10, 20, 30))
+
+ggsave(p, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/map/ratio_E8.5_ant_post_poolnormalised.pdf", width = 2.5, height = 4)
+
+ratio = tab["Paraxial mesoderm",]/tab["Somitic mesoderm",]
+ratio_pool = ratio[seq(1,length(ratio),2)]
+
+p = ggplot(mapping = aes(x = grepl("WT", names(ratio_pool)), y = ratio_pool)) +
+  geom_jitter(height = 0, width = 0.1) +
+  scale_x_discrete(labels = c("TRUE" = "WT\nchimeras", "FALSE" = "T\nchimeras")) +
+  theme(axis.title.x = element_blank()) +
+  labs(y = "Ant. cells/Post. cells") +
+  ggtitle("E8.5") +
+  scale_y_continuous(breaks = c(0, 1, 5, 10, 20, 30))
+
+ggsave(p, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/map/ratio_E8.5_ant_post_direct.pdf", width = 2.5, height = 4)
+
+```
+
+## Doublet rates
+
+The fraction of doublets in each of the 10X samples is shown in Figure \@ref(fig:doublets)
+
+```{r doublets, fig.cap = "Number of doublets called in chimera samples"}
+
+pdf = data.frame(ncells = sapply(unique(meta$sample), function(x) sum(meta$sample == x)),
+                 fracdoubs = sapply(unique(meta$sample), function(x) sum(meta$celltype.mapped == "Doublet" &
+                                                           meta$sample == x) / sum(meta$sample == x)))
+
+ggplot(pdf, aes(x = ncells, y= fracdoubs)) +
+  geom_point() +
+  scale_y_continuous(breaks = c(0,0.05,0.1, 0.15), labels = c("0%", "5%", "10%", "15%"), limits = c(0,0.18)) +
+  labs(x = "Cells in sample", y = "Fraction doublets")
+
+```
+
+Moreover, do the cells that were mapped as doublets look like doublets? To evaluate this, we calculate the doublet density score (`scran::doubletCells`) and compare between those cells that were and were not mapped to doublets. The result is shown in Figure \@ref(fig:doub-score)
+
+```{r doub-score, fig.cap = "Doublet scores for singlet- or doublet-mapped cells."}
+
+scores = lapply(unique(meta$sample), function(x){
+  doubletCells(scater::normalize(sce[,meta$sample == x]), approximate = TRUE)
+})
+
+scores = do.call(c, scores)
+
+meta$doub.density = scores
+
+ggplot(meta, aes(x = celltype.mapped == "Doublet", y = doub.density + 1)) +
+  geom_boxplot() +
+  scale_y_log10(name = "Doublet score + 1")+
+  scale_x_discrete(labels = c("TRUE" = "Doublet-mapped", "FALSE" = "Singlet-mapped"), name = "")
+
+```
+
+## Host/Injected cell frequency comparisons
+
+Here, the fold-changes in terms of celltype frequency for each pair of samples (i.e., matched ) is shown.
+
+```{r biases, fig.wide = TRUE, fig.height = 15, fig.cap = "Relative frequencies of mapped cell type per embryo pool", warning = FALSE, message =FALSE}
+
+bigtab = sapply(unique(meta$pool), function(x){
+  sub_meta = meta[meta$pool == x,]
+  tab = table(factor(sub_meta$celltype.mapped, levels= unique(meta$celltype.mapped), ordered = TRUE),
+              sub_meta$tomato)
+  tab = sweep(tab, 2, colSums(tab), "/")
+  ratio = tab[,"TRUE"]/tab[,"FALSE"]
+  return(log2(ratio))
+})
+colnames(bigtab) = paste0("Pool ", unique(meta$pool), ", ", meta$stage[match(unique(meta$pool), meta$pool)])
+mlt = melt(bigtab)
+mlt$Var1 = factor(mlt$Var1, levels = c(names(celltype_colours), "Stripped", "Doublet"), ordered = TRUE)
+ggplot(mlt, aes(x = Var1, y = value, fill = Var1)) +
+  geom_bar(stat = "identity", col = "black") +
+  scale_fill_manual(values = c(celltype_colours, "Stripped" = "black", "Doublet"= "black")) +
+  facet_wrap(~Var2, ncol = 1) +
+  theme(legend.position = "none") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5),
+        axis.title.x = element_blank()) +
+  labs(y = "log2FC (Injected/Host)")
+```
+
+# Get mapped PCA with all atlas data present
+
+```{r}
+save(complete_atlas, complete_meta, sce, meta, file = "debug.RData")
+#ensure no pool2
+
+pca = getMappedPCA(atlas_sce = complete_atlas, atlas_meta = complete_meta, map_sce = sce[-nrow(sce),], map_meta = meta)
+saveRDS(pca, file = "complete_mapped_pca.rds")
+
+
+nns = queryKNN(
+  X = pca[!grepl("map", rownames(pca)),], 
+  query = pca[grepl("map", rownames(pca)),],
+  k = 1,
+  get.index = TRUE)
+indices = nns$index
+rownames(indices) = paste0("map_", meta$cell)
+umap = read.table("/nfs/research1/marioni/jonny/embryos/scripts/vis/umap/umap.tab", sep = "\t", header = FALSE)
+rownames(umap) = complete_meta$cell[!(complete_meta$doublet | complete_meta$stripped)]
+names(umap) = c("x", "y")
+umap$colour = "none"
+
+
+```
+
+```{r}
+ant_cells_85_tom = paste0("map_", meta$cell[which(meta$somite.subct.mapped == "Anterior-most somites" & meta$stage == "E8.5" & meta$tomato)])
+ant_cells_85_tomn = paste0("map_", meta$cell[which(meta$somite.subct.mapped == "Anterior-most somites" & meta$stage == "E8.5" & !meta$tomato)])
+ant_cells_75_tom = paste0("map_", meta$cell[which(meta$trajectory.mapped == "ant" & meta$stage == "E7.5" & meta$tomato)])
+ant_cells_75_tomn = paste0("map_", meta$cell[which(meta$trajectory.mapped == "ant" & meta$stage == "E7.5" & !meta$tomato)])
+
+atlas_ant_85_tom = complete_meta$cell[unique(as.numeric(indices[ant_cells_85_tom,]))]
+atlas_ant_85_tomn = complete_meta$cell[unique(as.numeric(indices[ant_cells_85_tomn,]))]
+atlas_ant_75_tom = complete_meta$cell[unique(as.numeric(indices[ant_cells_75_tom,]))]
+atlas_ant_75_tomn = complete_meta$cell[unique(as.numeric(indices[ant_cells_75_tomn,]))]
+
+umap$colour = sapply(rownames(umap), function(x){
+  if(x %in% atlas_ant_85_tom){
+    return("E8.5 Tom+")
+  } else if(x %in% atlas_ant_85_tomn){
+    return("E8.5 Tom-")
+  } else if(x %in% atlas_ant_75_tom){
+    return("E7.5 Tom+")
+  } else if (x %in% atlas_ant_75_tomn){
+    return("E7.5 Tom-")
+  } else {return("Other")}
+})
+umap = umap[order(umap$colour, decreasing = TRUE),]
+umap = umap[c(sample(sum(umap$colour == "Other")), sample(sum(umap$colour != "Other")) + sum(umap$colour == "Other")),]
+pant = ggplot(umap) +
+geom_point(mapping = aes(x = x, y=  y, col = colour, size = colour)) +
+scale_colour_manual(values = c(
+  "E8.5 Tom+" = "red",
+  "E8.5 Tom-" = "black",
+  "E7.5 Tom+" = "#ec008c",
+  "E7.5 Tom-" = "#27aae1",
+  "Other" = "grey90")) +
+scale_size_manual(values = c(
+  "E8.5 Tom+" = 0.6,
+  "E8.5 Tom-" = 0.6,
+  "E7.5 Tom+" = 0.6,
+  "E7.5 Tom-" = 0.6,
+  "Other" = 0.1)) +
+ggtitle("Anterior somites") +
+theme(axis.text = element_blank(), axis.ticks = element_blank()) +
+labs(x = "UMAP1", y = "UMAP2")
+
+ggsave(pant, file = "plots/anterior_trajectory_mapped_umap.pdf", width = 6, height = 5)
+
+```
+
+
+```{r}
+post_cells_85_tom = paste0("map_", meta$cell[which(meta$somite.subct.mapped == "Posterior-most somites" & meta$stage == "E8.5" & meta$tomato)])
+post_cells_85_tomn = paste0("map_", meta$cell[which(meta$somite.subct.mapped == "Posterior-most somites" & meta$stage == "E8.5" & !meta$tomato)])
+post_cells_75_tom = paste0("map_", meta$cell[which(meta$trajectory.mapped == "post" & meta$stage == "E7.5" & meta$tomato)])
+post_cells_75_tomn = paste0("map_", meta$cell[which(meta$trajectory.mapped == "post" & meta$stage == "E7.5" & !meta$tomato)])
+
+atlas_post_85_tom = complete_meta$cell[unique(as.numeric(indices[post_cells_85_tom,]))]
+atlas_post_85_tomn = complete_meta$cell[unique(as.numeric(indices[post_cells_85_tomn,]))]
+atlas_post_75_tom = complete_meta$cell[unique(as.numeric(indices[post_cells_75_tom,]))]
+atlas_post_75_tomn = complete_meta$cell[unique(as.numeric(indices[post_cells_75_tomn,]))]
+
+umap$colour = sapply(rownames(umap), function(x){
+  if(x %in% atlas_post_85_tom){
+    return("E8.5 Tom+")
+  } else if(x %in% atlas_post_85_tomn){
+    return("E8.5 Tom-")
+  } else if(x %in% atlas_post_75_tom){
+    return("E7.5 Tom+")
+  } else if (x %in% atlas_post_75_tomn){
+    return("E7.5 Tom-")
+  } else {return("Other")}
+})
+umap = umap[order(umap$colour, decreasing = TRUE),]
+umap = umap[c(sample(sum(umap$colour == "Other")), sample(sum(umap$colour != "Other")) + sum(umap$colour == "Other")),]
+ppost = ggplot(umap) +
+geom_point(mapping = aes(x = x, y=  y, col = colour, size = colour)) +
+scale_colour_manual(values = c(
+  "E8.5 Tom+" = "red",
+  "E8.5 Tom-" = "black",
+  "E7.5 Tom+" = "#ec008c",
+  "E7.5 Tom-" = "#27aae1",
+  "Other" = "grey90")) +
+scale_size_manual(values = c(
+  "E8.5 Tom+" = 0.6,
+  "E8.5 Tom-" = 0.6,
+  "E7.5 Tom+" = 0.6,
+  "E7.5 Tom-" = 0.6,
+  "Other" = 0.1)) +
+ggtitle("Posterior somites") +
+theme(axis.text = element_blank(), axis.ticks = element_blank()) +
+labs(x = "UMAP1", y = "UMAP2")
+
+ggsave(ppost, file = "plots/posterior_trajectory_mapped_umap.pdf", width = 6, height = 5)
+
+```
+
+```{r}
+nmp_cells_85_tom = paste0("map_", meta$cell[which(meta$celltype.mapped == "NMP" & meta$stage == "E8.5" & meta$tomato)])
+nmp_cells_85_tomn = paste0("map_", meta$cell[which(meta$celltype.mapped == "NMP" & meta$stage == "E8.5" & !meta$tomato)])
+nmp_cells_75_tom = paste0("map_", meta$cell[which(meta$trajectory.mapped == "nmp" & meta$stage == "E7.5" & meta$tomato)])
+nmp_cells_75_tomn = paste0("map_", meta$cell[which(meta$trajectory.mapped == "nmp" & meta$stage == "E7.5" & !meta$tomato)])
+
+atlas_nmp_85_tom = complete_meta$cell[unique(as.numeric(indices[nmp_cells_85_tom,]))]
+atlas_nmp_85_tomn = complete_meta$cell[unique(as.numeric(indices[nmp_cells_85_tomn,]))]
+atlas_nmp_75_tom = complete_meta$cell[unique(as.numeric(indices[nmp_cells_75_tom,]))]
+atlas_nmp_75_tomn = complete_meta$cell[unique(as.numeric(indices[nmp_cells_75_tomn,]))]
+
+umap$colour = sapply(rownames(umap), function(x){
+  if(x %in% atlas_nmp_85_tom){
+    return("E8.5 Tom+")
+  } else if(x %in% atlas_nmp_85_tomn){
+    return("E8.5 Tom-")
+  } else if(x %in% atlas_nmp_75_tom){
+    return("E7.5 Tom+")
+  } else if (x %in% atlas_nmp_75_tomn){
+    return("E7.5 Tom-")
+  } else {return("Other")}
+})
+umap = umap[order(umap$colour, decreasing = TRUE),]
+umap = umap[c(sample(sum(umap$colour == "Other")), sample(sum(umap$colour != "Other")) + sum(umap$colour == "Other")),]
+pnmp = ggplot(umap) +
+geom_point(mapping = aes(x = x, y=  y, col = colour, size = colour)) +
+scale_colour_manual(values = c(
+  "E8.5 Tom+" = "red",
+  "E8.5 Tom-" = "black",
+  "E7.5 Tom+" = "#ec008c",
+  "E7.5 Tom-" = "#27aae1",
+  "Other" = "grey90")) +
+scale_size_manual(values = c(
+  "E8.5 Tom+" = 0.6,
+  "E8.5 Tom-" = 0.6,
+  "E7.5 Tom+" = 0.6,
+  "E7.5 Tom-" = 0.6,
+  "Other" = 0.1)) +
+ggtitle("NMP") +
+theme(axis.text = element_blank(), axis.ticks = element_blank()) +
+labs(x = "UMAP1", y = "UMAP2")
+
+ggsave(pnmp, file = "plots/NMP_trajectory_mapped_umap.pdf", width = 6, height = 5)
+```
+
+
+
+#Save updated metadata
+
+```{r savemeta}
+#re-insert pool 2
+#this inserts NAs for the doubletscore
+fullmeta$doub.density = meta$doub.density[match(fullmeta$cell, meta$cell)]
+fullmeta$somite.subct.mapped = meta$somite.subct.mapped[match(fullmeta$cell, meta$cell)]
+fullmeta$trajectory.mapped = meta$trajectory.mapped[match(fullmeta$cell, meta$cell)]
+
+meta = fullmeta
+
+write.table(meta, file = "/nfs/research1/marioni/jonny/chimera-t/data/meta.tab", row.names = FALSE, col.names = TRUE, quote = FALSE, sep = "\t")
+
+```
+# Session Info
+```{r sessinf}
+sessionInfo()
+```

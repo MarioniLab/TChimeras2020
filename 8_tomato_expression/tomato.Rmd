@@ -1,0 +1,234 @@
+---
+title: "T Chimera: Segregation by transcript"
+author: "C Guibentif, J Griffiths chimera paper"
+output:
+  BiocStyle::html_document:
+    code_folding: hide
+    number_sections: yes
+    toc: yes  
+---
+
+In this script we look at the expression of genes that should redily discriminate between KO and WT cells.
+
+```{r load, message = FALSE}
+library(Matrix)
+library(scran)
+library(scater)
+library(knitr)
+library(reshape2)
+library(ggrepel)
+
+source("/nfs/research1/marioni/jonny/chimera-t/scripts/core_functions.R")
+load_data()
+
+
+```
+
+# td-Tomato
+
+```{r prep}
+
+plot_df = data.frame(count = counts(sce)[which(genes[,2] == "tomato-td"),],
+                     stage = meta$stage,
+                     tomato = ifelse(meta$tomato,
+                                     "Tomato+",
+                                     "Tomato-"))
+
+save(plot_df, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/tomato_transcript/pdf.RData")
+
+```
+
+```{r plot}
+
+
+p = ggplot(plot_df, aes(count, ..density.., fill = tomato)) +
+  geom_histogram(binwidth = 1) +
+  scale_fill_manual(values = c("Tomato+" = "red", "Tomato-" = "grey20")) +
+  facet_grid(stage ~ tomato) +
+  labs(x = "Tomato-td UMI count", y = "Frequency") +
+  theme(strip.background =element_rect(fill="white"),
+        strip.text = element_text(colour = 'black'),
+        legend.position = "none") +
+  scale_x_continuous(breaks = seq(0, 12, 1),
+                     labels = sapply(seq(0, 12, 1), function(x){
+                       ifelse(x %% 4 == 0, x, "")
+                     }))
+
+ggsave(p, file= "/nfs/research1/marioni/jonny/chimera-t/scripts/tomato_transcript/tomato.pdf", width = 6, height = 6)
+
+```
+
+```{r tables}
+
+tab = table(plot_df$count, plot_df$tomato)
+kable(tab, caption = "Number of Tomato-td counts per cell, split by sort status")
+
+kable(sweep(tab, 2, colSums(tab), "/"), caption = "Frequency of Tomato-td counts per cell, split by sort status")
+
+```
+
+# Brachyury
+## T chimaera
+```{r bra}
+lcs = logcounts(sce)[which(genes[,2] == "T"),]
+df = data.frame(
+  sample = meta$sample,
+  celltype = meta$celltype.mapped,
+  logcount = lcs,
+  tomato = meta$tomato,
+  stage = meta$stage
+)
+
+df = df[df$stage == "E8.5",]
+tab = table(df$celltype, df$tomato)
+tab_min = apply(
+  tab,
+  1,
+  min
+)
+ct_allowed = names(tab_min)[tab_min>10]
+ct_allowed = ct_allowed[!ct_allowed %in% c("Doublet", "Stripped")]
+mlc = aggregate(formula = logcount ~ celltype + tomato, data = df, FUN = mean)
+mlc = mlc[mlc$celltype %in% ct_allowed,]
+mlc = mlc[order(mlc$logcount, decreasing = TRUE),]
+mlc$label = sapply(1:nrow(mlc), function(x){
+  paste0(
+    mlc$celltype[x],
+    " (",
+    tab[mlc$celltype[x], "TRUE"],
+    "|",
+    tab[mlc$celltype[x], "FALSE"],
+    ")"
+  )
+})
+
+
+p1 = ggplot(mlc, 
+  aes(x = factor(celltype, levels = unique(mlc$celltype), ordered = TRUE), 
+    fill = tomato, 
+    y = logcount)) +
+    geom_bar(position = "dodge", stat = "identity") +
+    theme(axis.text.x = element_text(angle = 60, hjust = 1, vjust = 1),
+      axis.title.x = element_blank(),
+      legend.position = c(0.5, 0.65)) +
+    scale_fill_manual(
+      values = c("TRUE" = "red", "FALSE" = "black"),
+      labels = c("TRUE" = "Tomato+", "FALSE" = "Tomato-"),
+      name = ""
+    ) +
+    labs(y = "Mean T logcount")
+
+mlc2 = mlc[mlc$tomato,]
+mlcneg = mlc[!mlc$tomato,]
+mlc2$logcountneg = mlcneg$logcount[match(mlc2$celltype, mlcneg$celltype)]
+labels = mlc2[mlc2$logcount > 0.2,]
+
+p2 = ggplot(mlc2, aes(x = logcount, y = logcountneg, col = celltype)) +
+  geom_point() +
+  geom_abline(slope = 1, intercept = 0) +
+  scale_x_log10() + scale_y_log10() +
+  labs(x = "Mean T expression (Tomato+)", y = "Mean T expression (Tomato-)" ) +
+  scale_colour_manual(values = celltype_colours) +
+  theme(legend.position = "none") +
+  geom_text_repel(aes(label = label), data = labels, col = "black")
+p3 = ggplot(mlc2, aes(x = logcount, y = logcountneg, col = celltype)) +
+  geom_point() +
+  geom_abline(slope = 1, intercept = 0) +
+  labs(x = "Mean T expression (Tomato+)", y = "Mean T expression (Tomato-)" ) +
+  scale_colour_manual(values = celltype_colours) +
+  theme(legend.position = "none") +
+  geom_text_repel(aes(label = label), data = labels, col = "black")
+
+grid = plot_grid(p1, plot_grid(p2, p3, align = "hv"), ncol = 1,
+  rel_heights = c(0.6, 0.4))
+ggsave(grid, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/tomato_transcript/tchim_t_plot.pdf", width = 8, height = 6)
+
+grid
+```
+
+## WT chimaera
+
+```{r bra-wt}
+source("/nfs/research1/marioni/jonny/chimera-wt/scripts/core_functions.R")
+load_data()
+
+
+lcs = logcounts(sce)[which(genes[,2] == "T"),]
+df = data.frame(
+  sample = meta$sample,
+  celltype = meta$celltype.mapped,
+  logcount = lcs,
+  tomato = meta$tomato,
+  stage = meta$stage
+)
+
+df = df[df$stage == "E8.5",]
+tab = table(df$celltype, df$tomato)
+tab_min = apply(
+  tab,
+  1,
+  min
+)
+ct_allowed = names(tab_min)[tab_min>10]
+ct_allowed = ct_allowed[!ct_allowed %in% c("Doublet", "Stripped")]
+mlc = aggregate(formula = logcount ~ celltype + tomato, data = df, FUN = mean)
+mlc = mlc[mlc$celltype %in% ct_allowed,]
+mlc = mlc[order(mlc$logcount, decreasing = TRUE),]
+mlc$label = sapply(1:nrow(mlc), function(x){
+  paste0(
+    mlc$celltype[x],
+    " (",
+    tab[mlc$celltype[x], "TRUE"],
+    "|",
+    tab[mlc$celltype[x], "FALSE"],
+    ")"
+  )
+})
+
+
+p1 = ggplot(mlc, 
+  aes(x = factor(celltype, levels = unique(mlc$celltype), ordered = TRUE), 
+    fill = tomato, 
+    y = logcount)) +
+    geom_bar(position = "dodge", stat = "identity") +
+    theme(axis.text.x = element_text(angle = 60, hjust = 1, vjust = 1),
+      axis.title.x = element_blank(),
+      legend.position = c(0.5, 0.65)) +
+    scale_fill_manual(
+      values = c("TRUE" = "red", "FALSE" = "black"),
+      labels = c("TRUE" = "Tomato+", "FALSE" = "Tomato-"),
+      name = ""
+    ) +
+    labs(y = "Mean T logcount")
+
+mlc2 = mlc[mlc$tomato,]
+mlcneg = mlc[!mlc$tomato,]
+mlc2$logcountneg = mlcneg$logcount[match(mlc2$celltype, mlcneg$celltype)]
+labels = mlc2[mlc2$logcount > 0.2,]
+
+p2 = ggplot(mlc2, aes(x = logcount, y = logcountneg, col = celltype)) +
+  geom_point() +
+  geom_abline(slope = 1, intercept = 0) +
+  scale_x_log10() + scale_y_log10() +
+  labs(x = "Mean T expression (Tomato+)", y = "Mean T expression (Tomato-)" ) +
+  scale_colour_manual(values = celltype_colours) +
+  theme(legend.position = "none") +
+  geom_text_repel(aes(label = label), data = labels, col = "black")
+p3 = ggplot(mlc2, aes(x = logcount, y = logcountneg, col = celltype)) +
+  geom_point() +
+  geom_abline(slope = 1, intercept = 0) +
+  labs(x = "Mean T expression (Tomato+)", y = "Mean T expression (Tomato-)" ) +
+  scale_colour_manual(values = celltype_colours) +
+  theme(legend.position = "none") +
+  geom_text_repel(aes(label = label), data = labels, col = "black")
+
+grid = plot_grid(p1, plot_grid(p2, p3, align = "hv"), ncol = 1,
+  rel_heights = c(0.6, 0.4))
+ggsave(grid, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/tomato_transcript/wtchim_t_plot.pdf", width = 8, height = 6)
+
+grid
+```
+# Session Info
+```{r sessinf}
+sessionInfo()
+```
