@@ -9,6 +9,6 @@ A singularity container with the software versions used in these analyses can be
 
 The data is available in the [MouseGastrulationData](https://www.bioconductor.org/packages/devel/data/experiment/html/MouseGastrulationData.html) Bioconductor package, from version 3.12 onwards.
 The function `TChimeraData` will get the processed single-cell RNAseq data from the chimeras, and `EmbryoAtlasData` the data from the atlas.
-For accessory files related to this paper (masses, NMP orderings, trajectories etc.) please see the function `GuibentifData` (which is to-be-implemented at the time of writing).
+For accessory files related to this paper (masses, NMP orderings, trajectories etc.) please see the function `GuibentifExtraData` (which is to-be-implemented at the time of writing).
 
 An interactive app for the data will be available shortly.
