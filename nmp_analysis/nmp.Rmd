@@ -1,0 +1,2911 @@
+---
+title: "T chimera - NMP investigation"
+author: "C. Guibentif, J. Griffiths et al. Chimera"
+output:
+  BiocStyle::html_document:
+    code_folding: hide
+    number_sections: yes
+    toc: yes  
+    titlecaps: true
+---
+
+# Introduction
+
+In this document, we will analyse the NMP population of cells in the Brachyury chimera.
+
+```{r load-atlas, message = FALSE, warning = FALSE}
+library(Matrix)
+library(scran)
+library(Rtsne)
+library(irlba)
+library(igraph)
+library(reshape2)
+library(scales)
+library(ggrepel)
+library(destiny)
+library(scater)
+library(matrixStats)
+# library(velocyto.R)
+library(biomaRt)
+library(pheatmap)
+library(BiocNeighbors)
+library(pheatmap)
+library(uwot)
+
+library(knitr)
+knitr::opts_chunk$set(cache=TRUE, warning = FALSE, 
+                      message = FALSE, cache.lazy = FALSE)
+
+#set it up for scran to be properly parallelised
+library(BiocParallel)
+ncores = 1
+mcparam = MulticoreParam(workers = ncores)
+register(mcparam)
+
+keep_celltypes = c("NMP",
+                   "Spinal cord",
+                   "Somitic mesoderm",
+                   "Paraxial mesoderm",
+                   "Caudal epiblast",
+                   "Caudal Mesoderm",
+                   "Intermediate mesoderm")
+
+# ATLAS
+source("/nfs/research1/marioni/jonny/embryos/scripts/core_functions.R")
+load_data(remove_doublets = TRUE, remove_stripped = TRUE, load_corrected = FALSE)
+#get cells only from E8.5
+atlas = scater::normalize(sce[, meta$celltype %in% keep_celltypes & meta$stage == "E8.5"])
+atlas_meta = meta[meta$celltype %in% keep_celltypes & meta$stage == "E8.5",]
+
+annot_post = read.table("/nfs/research1/marioni/jonny/chimera-t/scripts/somitogenesis/data/somiticmeso_e85_annotation.txt", header = TRUE, stringsAsFactors = FALSE)
+annot_ant = read.table("/nfs/research1/marioni/jonny/chimera-t/scripts/somitogenesis/data/paraxialmeso_e85_annotation.txt", header = TRUE, stringsAsFactors = FALSE)
+atlas_meta$celltype_som = atlas_meta$celltype
+atlas_meta$celltype_som[match(annot_post$cell, atlas_meta$cell)] = annot_post$celltype
+atlas_meta$celltype_som[match(annot_ant$cell, atlas_meta$cell)] = annot_ant$celltype
+atlas_meta$celltype_som = gsub("_", " ", atlas_meta$celltype_som)
+
+save(atlas, atlas_meta, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/nmp/cache/atlas_data_E8.5.RData")
+
+```
+
+```{r load-wt}
+
+source("/nfs/research1/marioni/jonny/chimera-wt/scripts/core_functions.R")
+load_data(remove_doublets = TRUE, remove_stripped = TRUE, load_corrected = TRUE)
+
+keeps = meta$celltype.mapped %in% keep_celltypes & meta$stage == "E8.5"
+
+meta_8.5 = meta[meta$stage == "E8.5",]
+corrected = corrected[[2]][meta_8.5$celltype.mapped %in% keep_celltypes,]
+
+sce = scater::normalize(sce[,keeps])
+meta = meta[keeps,]
+
+wt_sce = sce
+wt_meta = meta
+wt_corrected = corrected
+
+save(wt_sce, wt_meta, wt_corrected, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/nmp/cache/wt_chimera.RData")
+
+```
+
+```{r load-t}
+
+#now bring in the chimera
+source("/nfs/research1/marioni/jonny/chimera-t/scripts/core_functions.R")
+load_data(remove_doublets = TRUE, remove_stripped = TRUE, load_corrected = TRUE)
+
+keeps = meta$celltype.mapped %in% keep_celltypes & meta$stage == "E8.5"
+
+# meta_8.5 = meta[meta$stage == "E8.5",]
+# corrected = corrected[[2]][meta_8.5$celltype.mapped %in% keep_celltypes,]
+
+sce = scater::normalize(sce[,keeps])
+meta = meta[keeps,]
+
+save(sce, meta, genes, #corrected, 
+  file = "/nfs/research1/marioni/jonny/chimera-t/scripts/nmp/cache/data.RData")
+
+load("/nfs/research1/marioni/jonny/chimera-t/scripts/nmp/cache/data.RData")
+
+```
+
+```{r add_somite_celltypes}
+#use $somite.subct.mapped instead of $celltype.mapped
+new_ct = unique(meta$somite.subct.mapped[!meta$somite.subct.mapped %in% meta$celltype.mapped])
+new_ct = new_ct[!is.na(new_ct)]
+new_cols = scales::brewer_pal(palette = "Dark2")(length(new_ct))
+names(new_cols) = new_ct
+celltype_colours = c(celltype_colours, new_cols)
+meta$somite.subct.mapped[is.na(meta$somite.subct.mapped)] = meta$celltype.mapped[is.na(meta$somite.subct.mapped)]
+```
+
+# Landscape of the atlas
+
+We have first subset the atlas to contain only cells that play a role in the formation of the intermediate and somitic mesoderm, and the NMPs, where we have seen an imbalance of contribution from the two populations in the chimera. 
+The location of these celtypes in the atlas UMAP is shown in Figure \@ref(fig:umap-all).
+
+```{r umap-all, fig.wide = TRUE, fig.height = 8, fig.cap = "Retained celltypes are shown."}
+
+umap_all = read.table("/nfs/research1/marioni/jonny/embryos/scripts/vis/umap/umap.tab", sep = "\t", header = FALSE)
+big_meta = read.table("/nfs/research1/marioni/jonny/embryos/data/meta.tab", sep = "\t", header = TRUE, stringsAsFactors = FALSE)
+celltypes = big_meta$celltype[!(big_meta$doublet | big_meta$stripped)]
+rownames(umap_all) = big_meta$cell[!(big_meta$doublet | big_meta$stripped)]
+
+celltypes[!celltypes%in%keep_celltypes] = "Other"
+umap_all$ct = celltypes
+
+ggplot(mapping = aes(x = V1, y = V2, col =ct)) +
+  geom_point(data = umap_all[umap_all$ct == "Other",], size = 0.6) +
+  geom_point(data = umap_all[umap_all$ct != "Other",], size = 0.6) +
+  scale_color_manual(values = c(celltype_colours, "Other" = "darkgrey"),
+                     name = "Celltype") +
+  no_ticks + no_title +
+  guides(colour = guide_legend(override.aes = list(size=7)))   
+
+  
+```
+
+Particularly, we want to focus on the atlas cells from E8.5 - these are the cells that match the timepoint of the chimaeras of interest (note that we did not observe any substantial developmental delays when we performed mapping).
+These cells are shown in Figure \@ref(fig:umap-85)
+
+```{r umap-85, fig.wide = TRUE, fig.height = 8, fig.cap = "Retained celltypes are shown in E8.5 cells."}
+
+celltypes[big_meta$stage[!(big_meta$doublet | big_meta$stripped)] != "E8.5"] = "Other"
+umap_all$ct = celltypes
+
+ggplot(mapping = aes(x = V1, y = V2, col =ct)) +
+  geom_point(data = umap_all[umap_all$ct == "Other",], size = 0.6) +
+  geom_point(data = umap_all[umap_all$ct != "Other",], size = 0.6) +
+  scale_color_manual(values = c(celltype_colours, "Other" = "darkgrey"),
+                     name = "Celltype") +
+  no_ticks + no_title +
+  guides(colour = guide_legend(override.aes = list(size=7))) 
+
+
+
+```
+
+These cells are shown with the high-resolution somite-cluster colouring in Figure \@ref(fig:hidef)
+
+```{r hidef}
+parax = read.table(
+  "/nfs/research1/marioni/jonny/chimera-t/scripts/somitogenesis/data/paraxialmeso_e85_annotation.txt", 
+  header = TRUE,
+  stringsAsFactors = FALSE)
+somit = read.table(
+  "/nfs/research1/marioni/jonny/chimera-t/scripts/somitogenesis/data/somiticmeso_e85_annotation.txt", 
+  header = TRUE,
+  stringsAsFactors = FALSE)
+both = rbind(parax, somit)
+both$celltype = gsub("_", " ", both$celltype)
+umap_all$ct2 = umap_all$ct
+umap_all[both$cell, "ct2"] = both$celltype
+# ref_meta$som_sub[match(both$cell, ref_meta$cell)] = both$celltype[match(both$cell, ref_meta$cell)]
+palette = c(celltype_colours, scales::brewer_pal(palette = "Dark2")(length(unique(both$celltype))))
+names(palette) = c(names(celltype_colours), unique(both$celltype))
+
+p = ggplot(mapping = aes(x = V1, y = V2, col =ct2)) +
+  geom_point(data = umap_all[umap_all$ct2 == "Other",], size = 0.6, col = "darkgrey") +
+  geom_point(data = umap_all[umap_all$ct2 != "Other",], size = 0.6) +
+  scale_color_manual(values = palette,
+                     name = "Celltype") +
+  no_ticks + no_title +
+  guides(colour = guide_legend(override.aes = list(size=7))) 
+
+ggsave(
+  p, 
+  file = "/nfs/research1/marioni/jonny/chimera-t/scripts/nmp/paper_figs/umap_atlas_somite_celltypes.pdf",
+  width = 7,
+  height = 5
+  )
+
+```
+
+Now we extract those cells, and project themselves together (with a new, high-resolution batch effect correction computed here).
+UMAP projections of cell transcriptomes are shown in Figure \@ref(fig:umap-atlas)
+
+```{r umap-atlas, fig.wide = TRUE, fig.height = 6, fig.cap = "Atlas UMAP - E8.5 cells.", warning = FALSE}
+
+load("/nfs/research1/marioni/jonny/chimera-t/scripts/nmp/cache/atlas_data_E8.5.RData")
+
+tab = table(atlas_meta$sample)
+tab = tab[order(tab, decreasing = TRUE)]
+#timepoint ordering is built-in to this function (degault argument)
+corrected_atlas = doBatchCorrect(logcounts(atlas[getHVGs(atlas),]), timepoints= atlas_meta$stage, samples = atlas_meta$sample, sample_order = names(tab))
+
+umap = getUMAP(corrected_atlas)
+atlas_umap = umap
+
+ord = sample(nrow(atlas_umap), nrow(atlas_umap))
+celltype = ggplot(atlas_umap[ord,], aes(x = V1, y=V2, col = atlas_meta$celltype_som[ord])) +
+  geom_point(size = 0.5)+
+  scale_colour_manual(values = celltype_colours, name = "Celltype") +
+  no_ticks +
+          guides(colour = guide_legend(override.aes = list(size=7)))    +
+  labs(x = "UMAP1",  y = "UMAP2") +
+  coord_fixed()
+
+
+celltype
+
+ggsave(celltype, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/nmp/plots/atlas_umap_85.pdf",
+       width = 6, height = 4)
+
+ggsave(celltype, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/nmp/paper_figs/fig3_atlas_umap_ct.pdf",
+       width = 6, height = 4)
+
+
+```
+
+This is shown without the intermediate mesoderm below
+
+```{r}
+atlas_meta_nointer = atlas_meta[atlas_meta$celltype != "Intermediate mesoderm",]
+
+tab = table(atlas_meta_nointer$sample)
+tab = tab[order(tab, decreasing = TRUE)]
+
+corrected_atlas_nointer = doBatchCorrect(
+  logcounts(atlas[getHVGs(atlas), atlas_meta$celltype != "Intermediate mesoderm"]), 
+  timepoints= atlas_meta_nointer$stage, 
+  samples = atlas_meta_nointer$sample, 
+  sample_order = names(tab))
+
+umap_nointer = getUMAP(corrected_atlas_nointer)
+
+ord_inter = sample(nrow(umap_nointer), nrow(umap_nointer))
+celltype_nointer = ggplot(umap_nointer[ord_inter,], aes(x = V1, y=V2, col = atlas_meta_nointer$celltype_som[ord_inter])) +
+  geom_point(size = 0.5)+
+  scale_colour_manual(values = celltype_colours, name = "Celltype") +
+  no_ticks +
+          guides(colour = guide_legend(override.aes = list(size=7)))    +
+  labs(x = "UMAP1",  y = "UMAP2") +
+  coord_fixed()
+
+
+celltype_nointer
+
+ggsave(celltype_nointer, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/nmp/plots/atlas_umap_85_nointer.pdf",
+       width = 6, height = 4)
+
+ggsave(celltype_nointer, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/nmp/paper_figs/fig3_atlas_umap_ct_nointer.pdf",
+       width = 6, height = 4)
+
+```
+
+```{r}
+diag_genes = c("Dmrt2", "Pax3", "Myf5", "Meox1", "Tcf15", "Pax9", "Pax1", "Foxl2", "Tbx1", "Cyp26a1", "T")
+
+plots = lapply(
+  diag_genes, 
+  plot_expr, 
+  sce = atlas[, atlas_meta$celltype != "Intermediate mesoderm"],
+  coord_1 = umap_nointer[,1], 
+  coord_2 = umap_nointer[,2]
+  )
+
+grid = plot_grid(plotlist = plots, ncol = 2)
+save_plot(grid, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/nmp/plots/atlas_diagnostic_genes.pdf",
+          base_width = 5.5*1.2, base_height = 9.5*1.2)
+
+```
+
+The gene expression of several relevant genes is shown in Figure \@ref(fig:atlas-85-genes).
+These include:
+
+* *T*, *Tbx6*, two T-box transcription factors implicated in the progression of NMPs to a mesodermal fate
+
+* *Osr1*, a gene that marks the intermediate mesoderm
+
+* *Meox1*, a gene active in somites
+
+* *Aldh1a2*, a retinoic acid synthesising enzyme
+
+* *Cyp26a1*, a retinoic acid degrading enzyme
+
+```{r atlas-85-genes, fig.wide = TRUE, fig.height = 12, fig.cap = "Marker gene expression for somitogenic tissues."}
+
+genes_plot = c("T", "Sox2", "Nkx1-2", "Tbx6", "Osr1", "Meox1", "Aldh1a2", "Cyp26a1")
+plots = lapply(genes_plot, plot_expr, sce = atlas)
+
+gene_grid = plot_grid(plotlist = plots, ncol = 2, labels = letters[2:(length(plots)+1)],
+                      align = "hv")
+
+gene_grid
+
+```
+
+```{r}
+
+grid = plot_grid(celltype, gene_grid, ncol = 1, labels = c("a", ""),
+                 rel_heights = c(0.3, 0.7))
+save_plot(grid, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/nmp/plots/gene_celltype_atlas.pdf",
+          base_width = 5.5*1.2, base_height = 9.5*1.2)
+
+```
+
+We can investigate a bit more about the structure of these cells by reclustering in their own context alone (i.e., with a new set of HVGs etc.). Clusters are shown in Figure \@ref(fig:recluster).
+
+```{r recluster, fig.wide = TRUE, fig.cap = "New clusters computed in the atlas data."}
+
+graph = buildSNNGraph(corrected_atlas, d = NA, transposed = TRUE)
+clusts = as.numeric(membership(cluster_louvain(graph)))
+atlas_meta$clusters = clusts
+
+clusters =  ggplot(umap[ord,], aes(x = V1, y=V2, col = factor(clusts)[ord])) +
+  geom_point()+
+  scale_colour_Publication(name = "Cluster") +
+  no_ticks +
+  guides(colour = guide_legend(override.aes = list(size=7))) +
+  labs(x = "UMAP1", y = "UMAP2")
+
+plot_grid(clusters, celltype)
+
+```
+
+Largely, we have recapitulated the full atlas clusterings.
+The most unique marker genes for each of these clusters are shown in Figure \@ref(fig:recluster_genes)
+
+```{r recluster-genes, fig.height = 15, fig.wide = TRUE, fig.cap = "Gene expression markers for the reclustered atlas data."}
+
+get_gene_means = function(gene, gene_df = genes, sce_obj = atlas, celltypes = atlas_meta$celltype, clusters = clusts){
+  ens = as.character(genes[match(gene, genes[,2]),1])
+  expr = as.numeric(logcounts(sce_obj[ens,]))
+  medians = aggregate(formula = expr ~ clusters, FUN = mean)
+  mat = matrix(medians$expr, nrow = 1, dimnames = list(gene, medians$celltypes))
+  return(mat)
+}
+
+
+markers = findMarkers(atlas[getHVGs(atlas),], clusters = clusts, pval.type = "all", direction = "up")
+for(i in 1:length(markers)){
+  markers[[i]]$mgi = get_mgi(rownames(markers[[i]]))
+}
+
+unbiased = as.vector(sapply(markers, function(x) x$mgi[1:4]))
+
+
+
+# get.lowest = function(mgi){
+#   pos = sapply(markers, function(x) match(mgi, x$mgi))
+#   which.min(pos)
+# }
+
+
+# means = lapply(genes_plot, get_gene_means)
+means = lapply(unbiased, get_gene_means)
+combined = do.call(rbind,means)
+combined = sweep(combined, 1, apply(combined, 1, max), "/")
+
+
+
+# geneclust = hclust(dist(combined))
+# gene_order = geneclust$labels[geneclust$order]
+# clust_order = c("Paraxial mesoderm", 
+#                 "Somites", 
+#                 "Intermediate mesoderm", 
+#                 "Presomitic mesoderm", 
+#                 "NMP 1", 
+#                 "NMP 2",
+#                 "NMP 3",
+#                 "Spinal cord")
+# combined = combined[,clust_order]
+# combined= combined[order(apply(combined, 1, which.max)),]
+
+pdf = melt(combined)
+p1 = ggplot(pdf, aes(x = factor(Var2), y = Var1, fill = value)) +
+  geom_tile() +
+  scale_fill_viridis_c(labels = c("0","Max."), breaks = c(0,1), name = "Mean\nexpression", limits = c(0,1)) +
+  theme(axis.title = element_blank(), 
+        axis.line = element_blank(), 
+        axis.ticks = element_blank())#,
+        #axis.text.x = element_text(angle = -20, hjust = 0))
+
+
+p2 = ggplot(umap, aes(x = V1, y=V2, col = factor(clusts))) +
+  geom_point()+
+  scale_colour_Publication(name = "Cluster") +
+  no_title + no_ticks +
+          guides(colour = guide_legend(override.aes = list(size=7)))   
+
+
+plot_grid(p1, p2, ncol = 1, rel_heights = c(0.4, 0.4))
+
+```
+
+
+
+<!-- 
+```{r intermediate-test}
+
+# clusts = as.numeric(membership(cluster_louvain(buildSNNGraph(corrected_atlas, d = NA, transposed = TRUE))))
+
+# ggplot(atlas_umap, aes(x = V1, y=V2, col = factor(clusts))) +
+#   geom_point(size = 0.5)+
+#   scale_colour_Publication( name = "Cluster") +
+#   no_title + no_ticks +
+#           guides(colour = guide_legend(override.aes = list(size=7)))   
+
+```
+ -->
+# Overview of chimera cells
+
+Now, let's look at the cells from the chimeric embryos. 
+A UMAP embedding of the transcriptomes of these cells is shown in Figure \@ref(fig:umap-chimera), also showing where Tomato+ and Tomato- cells lie.
+
+```{r new-hvg}
+hvgs = getHVGs(sce)
+tab = table(meta$sample)
+corrected = doBatchCorrect(counts = logcounts(scater::normalize(sce[hvgs,])), 
+                          timepoints = meta$tomato, 
+                          samples = meta$sample, 
+                          timepoint_order = as.logical(c("TRUE", "FALSE")), 
+                          sample_order = as.numeric(names(tab[order(tab, decreasing = TRUE)])))
+```
+
+```{r umap-chimera, fig.wide= TRUE, fig.cap = "Overview of the selected cells for NMP investigation", fig.height = 4}
+umap = getUMAP(corrected)
+umap_chimera = umap
+rownames(umap_chimera) = meta$cell
+# tsne = Rtsne(corrected, pca = FALSE)$Y
+ro = sample(nrow(umap), nrow(umap))
+
+celltype = ggplot(umap_chimera[ro,], aes(x = V1, y=V2, col = meta$somite.subct.mapped[ro])) +
+  geom_point(size = 0.5)+
+  scale_colour_manual(values = celltype_colours, name = "Celltype") +
+  no_ticks +
+  guides(colour = guide_legend(override.aes = list(size=7))) +
+  labs(x = "UMAP1", y = "UMAP2") +
+  coord_fixed()
+
+tomato = ggplot(umap_chimera[ro,], aes(x = V1, y=V2, col = meta$tomato[ro])) +
+  geom_point(size = 0.5)+
+  scale_colour_manual(values = c("TRUE" = "red", "FALSE" = "black"), name = "",
+                      labels = c("TRUE" = "Tomato+", "FALSE" = "Tomato-")) +
+  no_ticks +
+  guides(colour = guide_legend(override.aes = list(size=7))) +
+  labs(x = "UMAP1", y = "UMAP2") +
+  coord_fixed()
+
+grid = plot_grid(celltype, tomato, align = "hv", labels = "auto")
+# plot_grid(plot_expr(gene_name = "Sox2"), plot_expr(gene_name = "T") , tomato, nrow = 1)
+
+grid
+
+save_plot(grid, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/nmp/plots/chimera_umap.pdf",
+          base_width = 12, base_height = 4)
+
+ggsave(celltype, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/nmp/paper_figs/fig3_tchim_umap_ct.pdf", width = 6, height = 4)
+ggsave(tomato, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/nmp/paper_figs/fig3_tchim_umap_tom.pdf", width = 6, height = 4)
+
+```
+
+This is then repeated without intermediate mesoderm in Figure \@ref(fig:umap-chimera-nointer).
+
+
+```{r new-hvg-nointer}
+sce_nointer = scater::normalize(sce[, meta$celltype != "Intermediate mesoderm"])
+meta_nointer = meta[meta$celltype != "Intermediate mesoderm", ]
+hvgs_nointer = getHVGs(sce_nointer)
+tab_nointer = table(meta_nointer$sample)
+corrected_nointer = doBatchCorrect(counts = logcounts(scater::normalize(sce_nointer[hvgs_nointer,])), 
+                          timepoints = meta_nointer$tomato, 
+                          samples = meta_nointer$sample, 
+                          timepoint_order = as.logical(c("TRUE", "FALSE")), 
+                          sample_order = as.numeric(names(tab_nointer[order(tab_nointer, decreasing = TRUE)])))
+```
+
+
+```{r umap-chimera-nointer, fig.wide= TRUE, fig.cap = "Overview of the selected cells for NMP investigation, without intermediate mesoderm", fig.height = 4}
+umap_nointer = getUMAP(corrected_nointer)
+umap_chimera_nointer = umap_nointer
+rownames(umap_chimera_nointer) = meta_nointer$cell
+# tsne = Rtsne(corrected, pca = FALSE)$Y
+ro = sample(nrow(umap_nointer), nrow(umap_nointer))
+
+celltype_nointer = ggplot(umap_chimera_nointer[ro,], aes(x = V1, y=V2, col = meta_nointer$somite.subct.mapped[ro])) +
+  geom_point(size = 0.5)+
+  scale_colour_manual(values = celltype_colours, name = "Celltype") +
+  no_ticks +
+  guides(colour = guide_legend(override.aes = list(size=7))) +
+  labs(x = "UMAP1", y = "UMAP2") +
+  coord_fixed()
+
+tomato_nointer = ggplot(umap_chimera_nointer[ro,], aes(x = V1, y=V2, col = meta_nointer$tomato[ro])) +
+  geom_point(size = 0.5)+
+  scale_colour_manual(values = c("TRUE" = "red", "FALSE" = "black"), name = "",
+                      labels = c("TRUE" = "Tomato+", "FALSE" = "Tomato-")) +
+  no_ticks +
+  guides(colour = guide_legend(override.aes = list(size=7))) +
+  labs(x = "UMAP1", y = "UMAP2") +
+  coord_fixed()
+
+grid = plot_grid(celltype_nointer, tomato_nointer, align = "hv", labels = "auto")
+# plot_grid(plot_expr(gene_name = "Sox2"), plot_expr(gene_name = "T") , tomato, nrow = 1)
+
+grid
+
+save_plot(grid, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/nmp/plots/chimera_umap_nointer.pdf",
+          base_width = 12, base_height = 4)
+
+ggsave(celltype_nointer, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/nmp/paper_figs/fig3_tchim_umap_ct_nointer.pdf", width = 6, height = 4)
+ggsave(tomato_nointer, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/nmp/paper_figs/fig3_tchim_umap_tom_nointer.pdf", width = 6, height = 4)
+
+```
+
+In Figure \@ref(fig:plot-voting), the same UMAP is plotted, with the cells coloured by the fraction of their nearest 20 neighbours that are Tomato positive (with distances measures in the corrected PCA space).
+
+```{r plot-voting, fig.cap = "Chimera cells projected in UMAP, coloured by the fraction of their 20 nearest neighbours that are Tomato positive."}
+
+nns = findKNN(X = corrected, k=20, get.index=TRUE, get.distance = FALSE)$index
+frac_pos = apply(nns, 1, function(x){
+  sum(meta$tomato[x]) / ncol(nns)
+})
+#this allows recalling of the plot later
+ro = sample(nrow(umap), nrow(umap))
+ro_bias = ro
+pbias = ggplot(umap_chimera[ro_bias,], aes(x = V1, y=V2, col = frac_pos[ro_bias] - 0.5)) +
+  geom_point(size = 0.5) +
+  scale_color_distiller(palette = "RdYlBu", name = "Neighbor\nbias", 
+                        breaks = c(-0.5, 0, 0.5), limits = c(-0.5, 0.5),
+                        labels = c("Tom-", "Both", "Tom+")) + 
+  labs(x = "UMAP1", y=  "UMAP2") +
+  no_ticks
+
+pbias
+
+ggsave(pbias, file ="/nfs/research1/marioni/jonny/chimera-t/scripts/nmp/plots/chimera_umap_voting.pdf",
+       width = 6, height = 4)
+
+grid = plot_grid(celltype, tomato, pbias, align = "hv", labels = "auto", nrow = 1)
+
+
+ggsave(pbias, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/nmp/paper_figs/fig3_tchim_umap_tombias.pdf", width = 6, height = 4)
+
+
+```
+
+It is immediately apparent that there is unequal distribution of cells at the interface between the NMP celltype and the somitic mesoderm celltype.
+The expression of marker genes for the plots above (i.e., as in Figure \@ref(fig:atlas-85-genes)) are shown for the chimera in Figure \@ref(fig:genes-chim).
+Note differences in the distribution and extent of expression of these genes between the two populations of cells
+
+```{r genes-chim, fig.cap = "Gene expression of the marker genes, shown in the chimera cells.", fig.wide = TRUE, fig.height = 24}
+
+meta$tomatoText = ifelse(meta$tomato, "Tomato+", "Tomato-")
+plot_expr_split = function(gene_name, coord_1 = umap_chimera[,1], coord_2 = umap_chimera[,2], labels = c("UMAP1", "UMAP2"), sce_obj = sce, metadata = meta){
+  plot_df = data.frame(X = coord_1,
+                       Y = coord_2, 
+                       expr = as.numeric(logcounts(sce_obj[match(gene_name, genes[,2]),])),
+                       tomato = metadata$tomatoText)
+  plot_df = plot_df[order(plot_df$expr, decreasing = FALSE),]
+  
+   p = ggplot(plot_df, aes(x = X, y=Y, col = expr)) +
+    geom_point() +
+    scale_color_gradient2(name = paste0(gene_name, "\nlog2\nexpr."), mid = "cornflowerblue", low = "gray75", high = "black", midpoint = max(plot_df$expr)/2) +
+     labs(x = labels[1], y= labels[2]) +
+     no_ticks +
+     facet_wrap(~tomato) +
+     ggtitle(gene_name)
+   
+   return(p)
+
+}
+
+split_plots = lapply(genes_plot, plot_expr_split)
+
+plot_grid(plotlist = split_plots, ncol = 1)
+
+```
+
+Importantly, we can also show that the chimaera NMPs are the canonical NMPs marked by opposing gradients of expression of T and Sox2, and also expressing Nkx1.2.
+A UMAP of the NMPs is shown in Figure \@ref(fig:real-nmps).
+
+```{r real-nmps, fig.wide = TRUE, fig.cap = "UMAP of T chimaera NMPs.", fig.height = 8}
+nmp_sce = scater::normalize(sce[, meta$celltype.mapped == "NMP"])
+nmp_meta = meta[meta$celltype.mapped == "NMP",]
+nmp_umap = getUMAP(corrected[colnames(nmp_sce),])
+ptom = ggplot(mapping = aes(x = nmp_umap[,1], y = nmp_umap[,2], col = nmp_meta$tomato)) +
+  geom_point(size = 0.5) +
+  scale_color_manual(values = c("TRUE" = "red", "FALSE" = "black"), 
+    name = "Tomato",
+    labels = c("TRUE" = "Tom+", "FALSE" = "Tom-")) +
+  labs(x = "UMAP1", y = "UMAP2") +
+  no_ticks +
+  guides(colour = guide_legend(override.aes = list(size=7)))
+exprs = lapply(c("T", "Sox2", "Nkx1-2"), plot_expr, coord_1 = nmp_umap[,1], coord_2 = nmp_umap[,2], sce_obj = nmp_sce)
+pl = c(list(ptom), exprs)
+grid = plot_grid(plotlist = pl, align = "hv")
+grid
+ggsave(grid, file = "paper_figs/tchim_nmps.pdf", width = 7, height = 7)
+```
+
+We can also show that NMPs of both tomato statuses coexpress T and Sox2.
+
+```{r coexp, fig.wide = TRUE, fig.cap = "Expression of T and Sox2 in T chimaera NMPs."}
+df = data.frame(
+  cell = nmp_meta$cell,
+  tomato = nmp_meta$tomato,
+  t_expr = as.numeric(logcounts(nmp_sce[match("T", genes[,2]),])),
+  sox2_expr = as.numeric(logcounts(nmp_sce[match("Sox2", genes[,2]),]))
+)
+
+p = ggplot(df, aes(x = t_expr, y = sox2_expr, col = tomato)) +
+  geom_point(size = 0.4) +
+  labs(x = "T normalised log count", y = "Sox2 normalised log count") +
+  facet_wrap(~tomato) +
+  scale_color_manual(values = c("TRUE" = "red", "FALSE" = "black"), 
+    name = "Tomato",
+    labels = c("TRUE" = "Tom+", "FALSE" = "Tom-")) + 
+  theme(legend.position = "none")
+p
+ggsave(p, file = "paper_figs/tchim_nmps_coexp.pdf", width = 10, height = 5)
+
+```
+# Mapping to the atlas
+
+Now we consider these two datasets together - the chimera and the atlas. 
+Specifically, we map the cells onto a single manifold using MNN in a shared PC subspace; the atlas cells were corrected first, to remove batch effects, after which the chimera cells were mapped onto that corrected manifold. 
+A UMAP embedding of the cells in these components is shown in Figure \@ref(fig:project-all). 
+Here we map only to the E8.5 stage.
+
+```{r project-all, fig.cap = "Chimera cells jointly projected with atlas cells.", warning= FALSE, message = FALSE}
+
+combined_pca = getMappedPCA(atlas, atlas_meta, sce[-nrow(sce),], meta)
+meta$mapped.name = paste0("map_", meta$cell)
+
+# tsne = as.data.frame(Rtsne(combined_pca, pca = FALSE)$Y)
+umap = getUMAP(combined_pca)
+
+names(umap) = c("X", "Y")
+rownames(umap) = rownames(combined_pca)
+umap$col = atlas_meta$celltype_som[match(rownames(umap), atlas_meta$cell)]
+umap$col[is.na(umap$col)] = ifelse(meta$tomato[match(rownames(umap[is.na(umap$col),]),
+                         meta$mapped.name)],
+                         "Tomato+",
+                         "Tomato-")
+
+ro = c(sample(which(!grepl("map", rownames(umap))), sum(!grepl("map", rownames(umap)))),
+       sample(which(grepl("map", rownames(umap))), sum(grepl("map", rownames(umap)))))
+project_t = ggplot(umap[ro,], aes(x = X, y= Y, col = col, alpha = grepl("Tom", col))) +
+  geom_point(size = 0.5) +
+  scale_color_manual(values = c(celltype_colours, "Tomato+"="Red", "Tomato-" = "black"), name = "Celltype") +
+  scale_alpha_manual(values = c("TRUE" = 1, "FALSE" = 0.4), labels = c("TRUE" = "Chimera cell", "FALSE" = "Atlas cell"), name = "Cell origin") +
+  labs(x = "UMAP1", y = "UMAP2") +
+    guides(colour = guide_legend(override.aes = list(size=6)),
+           alpha = guide_legend(override.aes = list(size=6)))  +
+  no_ticks +
+  coord_fixed()
+
+
+project_t
+ggsave(project_t, file ="/nfs/research1/marioni/jonny/chimera-t/scripts/nmp/plots/chimera_atlas_project.pdf",
+       width = 6, height = 4)
+
+ggsave(project_t, file ="/nfs/research1/marioni/jonny/chimera-t/scripts/nmp/paper_figs/fig3_tchim_atlas_project_umap.pdf",
+       width = 7, height = 4)
+
+```
+
+We see the same pattern as we observed with the chimera data alone: the absence of Tom+ cells in the paraxial/somitic mesoderm, and the enrichment of Tom+ cells at the mesodermal end of the NMP population. 
+The NMP-spinal cord trajectory appears unaffected.
+
+Note that the apparent disruption to Tomato positive cell distribution is in the region where *T* is highly expressed in the atlas, shown in Figure \@ref(fig:t-umap).
+
+```{r t-umap, fig.cap = "Brachyury expression levels in the atlas."}
+
+p= plot_expr("T",
+              umap[!grepl("map_", rownames(umap)),1],
+              umap[!grepl("map_", rownames(umap)),2],
+              sce = atlas)
+
+p
+
+ggsave(p, file ="/nfs/research1/marioni/jonny/chimera-t/scripts/nmp/plots/chimera_atlas_project_texpr.pdf",
+       width = 6, height = 4)
+
+```
+
+## WT-chimera shows uniform contributions
+
+It is important that we know that this effect is not just driven by the chimeric nature of the embryo, rather than the knockout itself. 
+Using our WT-chimeras (i.e., injected WT cells), we see that there is a consistent contribution across the atlas landscape, shown in Figure \@ref(fig:wt-chimera).
+
+```{r wt-chimera, fig.cap = "Contribution of wild-type chimera is uniform over the atlas."}
+
+load("/nfs/research1/marioni/jonny/chimera-t/scripts/nmp/cache/wt_chimera.RData")
+
+combined_wt_pca = getMappedPCA(atlas, atlas_meta, wt_sce[-nrow(wt_sce),], wt_meta)
+wt_meta$mapped.name = paste0("map_", wt_meta$cell)
+
+# tsne = as.data.frame(Rtsne(combined_pca, pca = FALSE)$Y)
+umap_wt = getUMAP(combined_wt_pca)
+
+names(umap_wt) = c("X", "Y")
+rownames(umap_wt) = rownames(combined_wt_pca)
+umap_wt$col = atlas_meta$celltype_som[match(rownames(umap_wt), atlas_meta$cell)]
+umap_wt$col[is.na(umap_wt$col)] = ifelse(wt_meta$tomato[match(rownames(umap_wt[is.na(umap_wt$col),]),
+                         wt_meta$mapped.name)],
+                         "Tomato+",
+                         "Tomato-")
+
+ro = c(sample(which(!grepl("map", rownames(umap_wt))), sum(!grepl("map", rownames(umap_wt)))),
+       sample(which(grepl("map", rownames(umap_wt))), sum(grepl("map", rownames(umap_wt)))))
+
+project_wt = ggplot(umap_wt[ro,], aes(x = X, y= Y, col = col, alpha = grepl("Tom", col))) +
+  geom_point(size = 0.5) +
+  scale_color_manual(values = c(celltype_colours, "Tomato+"="Red", "Tomato-" = "black"), name = "Celltype") +
+  scale_alpha_manual(values = c("TRUE" = 1, "FALSE" = 0.4), labels = c("TRUE" = "Chimera cell", "FALSE" = "Atlas cell"), name = "Cell origin") +
+  labs(x = "UMAP1", y = "UMAP2") +
+    guides(colour = guide_legend(override.aes = list(size=6)),
+           alpha = guide_legend(override.aes = list(size=6)))  +
+  no_ticks +
+  coord_fixed()
+
+project_wt
+ggsave(project_wt, file ="/nfs/research1/marioni/jonny/chimera-t/scripts/nmp/plots/chimera_atlas_project_wt.pdf",
+       width = 6, height = 4)
+
+ggsave(project_wt, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/nmp/paper_figs/fig3_wtchim_atlas_project_umap.pdf",
+       width = 7, height = 4)
+
+```
+
+# Defining a 1-D ordering for somitogenesis
+
+Previously, we have shown two-dimensional embeddings of the data. 
+However, the process that we are observing actually appears to be one-dimensional: imagine tracing a path in Figure \@ref(fig:wt-chimera) from the spinal cord, through the NMPs, and across the caudal, somitic and paraxial mesoderm.
+This ordering does, by itself, not represent any one-dimensional spatial or temporal process.
+Rather, it functions as a convenient summary of the transcriptional states that are present at this point of development.
+In this section, we define this 1-dimensional ordering of cells.
+
+This one-dimensional atlas will serve as a reference structure, onto which we can project the transcriptional profiles of the cells from the chimaeras.
+Therefore, we collect all of the cells from the atlas, T chimera, and WT chimera at E8.5, from the cell types that we have been analysing above.
+These are collected from the atlas in Figure \@ref(fig:dmap-inter).
+Note that the intermediate mesoderm shows a separate branching trajectory to the rest of the cells - we therefore exclude it from downstream analyses.
+
+```{r dmap-inter, fig.cap = "Diffusion map of the E8.5 atlas data. Note that the intermediate mesoderm shows a separate branch to the somitic mesoderm, and we therefore exclude it from downstream analyses."}
+
+keep_celltypes_inter = c("NMP", "Caudal epiblast", "Spinal cord", "Caudal Mesoderm", "Somitic mesoderm", "Paraxial mesoderm", "Intermediate mesoderm")
+with_inter = atlas[, atlas_meta$celltype %in% keep_celltypes_inter]
+pca = prcomp_irlba(t(logcounts(with_inter[getHVGs(with_inter),])), n = 50)$x
+rownames(pca) = colnames(with_inter)
+inter = correctAtlas(pca, atlas_meta[atlas_meta$celltype %in% keep_celltypes_inter,])
+inter_meta = atlas_meta[atlas_meta$celltype %in% keep_celltypes_inter,]
+inter_dmap = DiffusionMap(inter)
+
+ggplot(mapping = aes(x = inter_dmap$DC1, inter_dmap$DC2, col = inter_meta$celltype)) +
+  geom_point(size = 0.5) +
+  scale_color_manual(values = celltype_colours, name = "Celltype") +
+  labs(x = "DC1", y = "DC2") +
+  no_ticks +
+  guides(colour = guide_legend(override.aes = list(size=7))) +
+  coord_fixed()
+
+```
+
+In order to use this ordering as a common backbone across atlas and chimera experiments, we calculate a 50-PC subspace for cells from the relevant cell types from all of the E8.5 chimeras (i.e., the wild-type and T chimeras).
+In this subspace, we batch-corrected the atlas cells to make a single reference manifold.
+Because the cells now share a subspace, we will be able to map the chimera samples onto the reference ordering later in this script.
+
+We calculated diffusion map was then calculated from these corrected atlas cells, which is shown in Figure \@ref(fig:ref-dmap).
+A cell ordering in the atlas trajectory was determined using DPT, starting from the spinal cord cell with most extreme diffusion component value.
+
+```{r ref-dmap, fig.wide = TRUE, fig.height = 8, fig.cap = "DPT cell ordering of atlas cells. a, Cell types for each cell shown in the first two diffusion components. b, DPT values shown in the first two diffusion components. c, The blocks of colour underneath the density plot represent regions of domination of a celltype (a sliding window where the most of any celltype correspond to that colour)."}
+
+#combine and generate common subspace
+keep_celltypes = c("NMP", "Caudal epiblast", "Spinal cord", "Caudal Mesoderm", "Somitic mesoderm", "Paraxial mesoderm") # no inter mesoderm
+s1 = atlas[, atlas_meta$celltype %in% keep_celltypes] #just E8.25 and E8.5
+s1_inter = atlas[, atlas_meta$celltype %in% c(keep_celltypes, "Intermediate mesoderm")]
+
+s2 = sce[-nrow(sce), meta$celltype.mapped %in% keep_celltypes]
+sub_t_meta = meta[match(colnames(s2), meta$cell),]
+colnames(s2) = paste0("T_", colnames(s2))
+
+s3 = wt_sce[-nrow(wt_sce), wt_meta$celltype.mapped %in% keep_celltypes]
+sub_wt_meta = wt_meta[match(colnames(s3), wt_meta$cell),]
+colnames(s3) = paste0("WT_", colnames(s3))
+
+big_sce = scater::normalize(cbind(s1, s2, s3))
+pca = prcomp_irlba(t(logcounts(big_sce[getHVGs(big_sce),])), n = 50)$x
+rownames(pca) = colnames(big_sce)
+
+#correct the atlas within the subspace
+
+ref = correctAtlas(pca[!(grepl("T_", rownames(pca)) |
+                            grepl("WT_", rownames(pca))),], 
+                   atlas_meta[atlas_meta$celltype %in% keep_celltypes,])
+ref_meta = atlas_meta[atlas_meta$celltype %in% keep_celltypes,]
+ref_dmap = DiffusionMap(ref)
+ref_umap = getUMAP(ref)
+
+p1 = ggplot(mapping = aes(x = ref_dmap$DC1, ref_dmap$DC2, col = ref_meta$celltype_som)) +
+  geom_point(size = 0.5) +
+  scale_color_manual(values = celltype_colours, name = "Celltype") +
+  labs(x = "DC1", y = "DC2") +
+  no_ticks +
+  guides(colour = guide_legend(override.aes = list(size=7))) +
+  coord_fixed()
+
+dpt = DPT(ref_dmap)
+#start from spinal cord
+med_sc = median(ref_dmap$DC1[atlas_meta$celltype == "Spinal cord"], na.rm = TRUE)
+cell_name = ifelse(med_sc > 0,
+                   paste0("DPT", which.max(ref_dmap$DC1)),
+                   paste0("DPT", which.min(ref_dmap$DC1)))
+
+dpt_vec = dpt[[cell_name]]
+ref_meta$dpt = dpt_vec
+
+p2 =ggplot(mapping = aes(x = ref_dmap$DC1, ref_dmap$DC2, col = dpt_vec)) +
+  geom_point(size = 0.5) +
+  scale_color_viridis_c(name = "DPT") +
+  labs(x = "DC1", y = "DC2") +
+  no_ticks +
+  coord_fixed()
+
+
+
+window = data.frame(
+  centre =seq(0, max(ref_meta$dpt), length.out = 500)
+)
+window$call = sapply(window$centre, function(x){
+  keeps = ref_meta$dpt < (x+0.15) & ref_meta$dpt > (x-0.15)
+  dists = abs(ref_meta$dpt[keeps] - x)
+  getmode(ref_meta$celltype_som[keeps],
+          dist = dists)
+})
+
+annot = lapply(unique(window$call), function(x){
+  sub = window[window$call == x,]
+  max_row = as.numeric(rownames(sub)[nrow(sub)]) + 1
+  if(max_row > nrow(window)) max_row = nrow(window)
+  data.frame(start = min(sub$centre),
+             end = window$centre[max_row],
+             call = x,
+             stringsAsFactors = FALSE)
+})
+annot = do.call(rbind, annot)
+
+annotate_celltype = function(ymin = -0.05){
+  annotate(geom = "rect", xmin = annot$start, xmax = annot$end, ymin = rep(ymin, nrow(annot)), ymax = rep(-0.01, nrow(annot)), fill = celltype_colours[annot$call])
+}
+
+ref_density = ggplot(data = ref_meta, mapping = aes(x = dpt, fill = celltype)) +
+  geom_density(alpha = 0.8) +
+  scale_fill_manual(values = celltype_colours, name = "Celltype") +
+  labs(x = "DPT", y= "Density") +
+  annotate_celltype(ymin = -0.4)
+
+#this needs to be improved
+grid= plot_grid(plot_grid(p1, p2, 
+                          labels = "auto",
+                          align = "v"),
+                ref_density, 
+                ncol = 1, 
+                labels = c("", "c"))
+
+grid
+
+save_plot(grid, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/nmp/plots/dpt_atlas.pdf",
+          base_width = 8*1.5, base_height = 5*1.5)
+
+ggsave(p1, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/nmp/paper_figs/fig3_atlas_dmap_ct.pdf",
+       width = 6, height = 4)
+ggsave(p2, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/nmp/paper_figs/fig3_atlas_dmap_dpt.pdf",
+       width = 6, height = 4)
+
+
+
+p3 = ggplot(ref_umap, aes(x = V1, y=V2, col = dpt_vec)) +
+  geom_point(size = 0.5)+
+  scale_color_viridis_c(name = "DPT") +
+  no_ticks +
+  labs(x = "UMAP1",  y = "UMAP2") +
+  coord_fixed()
+
+p4 = ggplot(ref_umap, aes(x = V1, y=V2, col = ref_meta$celltype_som)) +
+  geom_point(size = 0.5)+
+  scale_color_manual(values = celltype_colours, name = "Celltype") +
+  no_ticks +
+  labs(x = "UMAP1",  y = "UMAP2") +
+  coord_fixed()
+
+ggsave(p3, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/nmp/paper_figs/fig3_atlas_umap_dpt.pdf",
+       width = 6, height = 4)
+ggsave(p4, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/nmp/paper_figs/fig3_atlas_umap_celltype_somiticclusters.pdf",
+       width = 6, height = 4)
+
+```
+
+The location of the subclusters identified in the somitic mesoderm trajectories (outside of this script) are shown in Figure \@ref(fig:som-sub)
+
+```{r som-sub, fig.wide = TRUE}
+parax = read.table(
+  "/nfs/research1/marioni/jonny/chimera-t/scripts/somitogenesis/data/paraxialmeso_e85_annotation.txt", 
+  header = TRUE,
+  stringsAsFactors = FALSE)
+somit = read.table(
+  "/nfs/research1/marioni/jonny/chimera-t/scripts/somitogenesis/data/somiticmeso_e85_annotation.txt", 
+  header = TRUE,
+  stringsAsFactors = FALSE)
+both = rbind(parax, somit)
+both$celltype = gsub("_", " ", both$celltype)
+ref_meta$som_sub = ref_meta$celltype
+for(i in 1:nrow(both)){
+  ref_meta$som_sub[match(both$cell[i], ref_meta$cell)] = both$celltype[i]
+}
+# ref_meta$som_sub[match(both$cell, ref_meta$cell)] = both$celltype[match(both$cell, ref_meta$cell)]
+keep = !is.na(ref_meta$som_sub)
+palette = c(celltype_colours, scales::brewer_pal(palette = "Dark2")(length(unique(both$celltype))))
+names(palette) = c(names(celltype_colours), unique(both$celltype))
+
+p = ggplot(data = ref_meta[keep,], mapping = aes(x = dpt, fill = som_sub)) +
+  geom_density(alpha = 0.8) +
+  scale_fill_manual(values = palette, name = "Somite cluster") +
+  labs(x = "DPT", y= "Density") +
+  annotate_celltype(ymin = -0.6)
+
+p
+
+ggsave(p, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/nmp/paper_figs/somite_subclusters.pdf",
+       width = 7, height = 3)
+```
+
+
+## Mapping from the chimaeras to the ordering
+
+In the shared subspace, we now map cells from the chimaeras onto the atlas manifold, in the PC subspace that was calculated above, using the MNN strategy.
+This is performed separately for each chimera sample (i.e., the results of mapping of one chimera sample never affects the results of mapping of another sample).
+We infer a value of DPT for each chimera cell by considering its nearest neighbours in the atlas data. 
+Specifically, we consider the 5 nearest neighbours in the diffusion map (across all 15 components calculated) for each chimera cell, and its inferred DPT value is the mean of these values.
+
+The projection of cells into the diffusion map and the inferred DPT value is shown in Figure \@ref(fig:infer-dpt-t) for the Brachyury chimeras, and Figure \@ref(fig:infer-dpt-wt) for the WT chimeras.
+
+```{r infer-dpt-t, fig.wide = TRUE, fig.cap = "Projection of chimera cells onto atlas data. Grey points on the right panel are atlas cells.", fig.height = 5}
+
+#now sequentially map on samples
+mapped_t = lapply(unique(sub_t_meta$sample), function(x){
+  out = mnnMap(atlas_pca = ref, map_pca = pca[which(sub_t_meta$sample==x) + nrow(ref),], return.pca = TRUE)$mapped
+  return(out)
+})
+mapped_t = do.call(rbind, mapped_t)
+
+proj_t = dm_predict(ref_dmap, mapped_t)
+
+shuffle = sample(nrow(proj_t), nrow(proj_t))
+p1 = ggplot(mapping = aes(x = ref_dmap$DC1, ref_dmap$DC2, col = ref_meta$celltype)) +
+  geom_point(size = 0.8, alpha = 0.5) +
+  geom_point(inherit.aes = FALSE, mapping = aes(x = proj_t[shuffle,1], y = proj_t[shuffle,2], col = ifelse(sub_t_meta$tomato, "Tom+", "Tom-")[shuffle]), size = 0.6) +
+  scale_color_manual(values = c(celltype_colours, "Tom+" = "red", "Tom-" = "black"), name = "Celltype") +
+  labs(x = "DC1", y = "DC2") +
+  guides(colour = guide_legend(override.aes = list(size=7)))  +
+  no_ticks
+
+knns = BiocNeighbors::queryKNN(ref_dmap@eigenvectors, as.matrix(proj_t), k = 5, get.distance = FALSE)
+sub_t_meta$dpt = apply(knns$index, 1, function(x){
+  mean(ref_meta$dpt[x])
+})
+
+p2 = ggplot() +
+  geom_point(mapping = aes(x = ref_dmap$DC1, ref_dmap$DC2), size = 0.8, alpha = 0.5, col = "darkgrey") +
+  geom_point(inherit.aes = FALSE, mapping = aes(x = proj_t[shuffle,1], y = proj_t[shuffle,2], col = sub_t_meta$dpt[shuffle]), size = 0.8) +
+  scale_color_viridis_c(name = "Inferred\nDPT") +
+  labs(x = "DC1", y = "DC2") +
+  no_ticks
+
+grid = plot_grid(p1, p2, align = "hv")
+grid
+
+save_plot(grid, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/nmp/plots/dpt_t.pdf",
+          base_width = 10, base_height = 3)
+
+```
+
+```{r infer-dpt-wt, fig.wide = TRUE, fig.cap = "Projection of chimera cells onto atlas data. Grey points on the right panel are atlas cells.", fig.height = 5}
+
+mapped_wt = lapply(unique(sub_wt_meta$sample), function(x){
+  out = mnnMap(atlas_pca = ref, map_pca = pca[which(sub_wt_meta$sample==x) + nrow(ref) + nrow(mapped_t),], return.pca = TRUE)$mapped
+  return(out)
+})
+mapped_wt = do.call(rbind, mapped_wt)
+
+proj_wt = dm_predict(ref_dmap, mapped_wt)
+
+shuffle = sample(nrow(proj_wt), nrow(proj_wt))
+p1 = ggplot(mapping = aes(x = ref_dmap$DC1, ref_dmap$DC2, col = ref_meta$celltype)) +
+  geom_point(size = 0.8, alpha = 0.5) +
+  geom_point(inherit.aes = FALSE, mapping = aes(x = proj_wt[shuffle,1], y = proj_wt[shuffle,2], col = ifelse(sub_wt_meta$tomato, "Tom+", "Tom-")[shuffle]), size = 0.6) +
+  scale_color_manual(values = c(celltype_colours, "Tom+" = "red", "Tom-" = "black"), name = "Celltype") +
+  labs(x = "DC1", y = "DC2") +
+  guides(colour = guide_legend(override.aes = list(size=7)))  +
+  no_ticks
+
+knns = BiocNeighbors::queryKNN(ref_dmap@eigenvectors, as.matrix(proj_wt), k = 5, get.distance = FALSE)
+sub_wt_meta$dpt = apply(knns$index, 1, function(x){
+  mean(ref_meta$dpt[x])
+})
+
+p2 = ggplot() +
+  geom_point(mapping = aes(x = ref_dmap$DC1, ref_dmap$DC2), size = 0.8, alpha = 0.5, col = "darkgrey") +
+  geom_point(inherit.aes = FALSE, mapping = aes(x = proj_wt[shuffle,1], y = proj_wt[shuffle,2], col = sub_wt_meta$dpt[shuffle]), size = 0.8) +
+  scale_color_viridis_c(name = "Inferred\nDPT") +
+  labs(x = "DC1", y = "DC2") +
+  no_ticks
+
+grid = plot_grid(p1, p2, align = "hv")
+grid
+
+save_plot(grid, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/nmp/plots/dpt_wt.pdf",
+          base_width = 10, base_height = 3)
+
+test.t = ks.test(sub_t_meta$dpt[sub_t_meta$tomato],
+                 sub_t_meta$dpt[!sub_t_meta$tomato])
+test.wt = ks.test(sub_wt_meta$dpt[sub_wt_meta$tomato],
+                 sub_wt_meta$dpt[!sub_wt_meta$tomato])
+save(test.t, test.wt, file = "ks.tests.RData")
+```
+
+```{r}
+#save for MGD
+save_df = function(meta, name = "atlas"){
+  tab = meta[, c("cell", "dpt")]
+  write.table(tab, 
+    file = paste0("/nfs/research1/marioni/jonny/chimera-t/data/MGD/nmp_ordering/", name, ".tsv"),
+    sep = "\t", quote = FALSE, row.names = FALSE, col.names = FALSE)
+  invisible(0)
+}
+
+save_df(ref_meta, "atlas")
+save_df(sub_t_meta, "t-chimera")
+save_df(sub_wt_meta, "wt-chimera")
+
+```
+
+The DPT values for the T chimaeras are shown on their UMAP in Figure \@ref(fig:dpt-umap-t), where the Intermediate mesoderm cells have been excluded
+
+```{r dpt-umap-t, fig.cap = "T chimaera DPT shown on its UMAP (intermediate mesoderm not plotted)."}
+
+ggplot(umap_chimera[meta$celltype.mapped != "Intermediate mesoderm",], 
+  aes(x = V1, y = V2, col = sub_t_meta$dpt)) +
+  geom_point(size = 0.8) +
+  scale_color_viridis_c(name = "Inferred\nDPT") +
+  labs(x = "UMAP1", y = "UMAP2") +
+  no_ticks
+
+```
+
+We can show the density of these chimaera cells varies along the DPT ordering. These are shown in Figure \@ref(fig:density-compare)
+
+```{r density-compare, fig.wide = TRUE, fig.cap = "DPT density plots for each chimera. Y-axes are DPT values, as determined by the projections described above. Each side of the violin shows the density of cells in either the Tomato+ or Tomato- fractions. The coloured rectangle in the centre is a sliding window over the atlas DPT values, where the colour corresponds to the most frequent cell type label observed in the window. Different chimeras are indicated on the x-axis.", fig.height = 6, warning = FALSE}
+
+ct_labs = names(celltype_colours)
+names(ct_labs) = ct_labs
+
+
+pretty_plot = function(dpt, tomato, experiment, rect_annot = annot, centre_width = 0.1, t_x_pos = 2){
+  #This is lifted directly from Axeman at https://stackoverflow.com/questions/35717353/split-violin-plot-with-ggplot2
+  require(dplyr)
+
+  pdat <- data.frame(y=dpt, x=experiment, m = tomato) %>%
+    group_by(x, m) %>%
+    do(data.frame(loc = density(.$y)$x,
+                  dens = density(.$y)$y))
+  
+  #flip tom-
+  pdat$dens <- ifelse(pdat$m == 'FALSE', pdat$dens * -1, pdat$dens)
+  #move to allow scaffold location
+  pdat$dens <- ifelse(pdat$m == 'FALSE', pdat$dens - centre_width/2, pdat$dens + centre_width/2)
+  #move the densities over for T chim
+  pdat$dens <- ifelse(pdat$x == 'T', pdat$dens + t_x_pos, pdat$dens)
+  
+  #chop off the density where there are no more cells
+  max.wt.tom = max(dpt[tomato & experiment == "WT"])
+  pdat = pdat[-which(pdat$m & pdat$x == "WT" & pdat$loc > max.wt.tom),]
+  pdat = bind_rows(pdat, tibble(m=TRUE, x = "WT", loc = max.wt.tom, dens = 0 + centre_width/2))
+  
+  min.wt.tom = min(dpt[tomato & experiment == "WT"])
+  pdat = pdat[-which(pdat$m & pdat$x == "WT" & pdat$loc < min.wt.tom),]
+  pdat = bind_rows(pdat, tibble(m=TRUE, x = "WT", loc = min.wt.tom, dens = 0 + centre_width/2))
+  
+  max.wt.not = max(dpt[!tomato & experiment == "WT"])
+  pdat = pdat[-which(!pdat$m & pdat$x == "WT" & pdat$loc > max.wt.not),]
+  pdat = bind_rows(pdat, tibble(m=FALSE, x = "WT", loc = max.wt.not, dens = 0 - centre_width/2))
+  
+  min.wt.not = min(dpt[!tomato & experiment == "WT"])
+  pdat = pdat[-which(!pdat$m & pdat$x == "WT" & pdat$loc < min.wt.not),]
+  pdat = bind_rows(pdat, tibble(m=FALSE, x = "WT", loc = min.wt.not, dens = 0 - centre_width/2))
+  
+  max.t.tom = max(dpt[tomato & experiment == "T"])
+  pdat = pdat[-which(pdat$m & pdat$x == "T" & pdat$loc > max.t.tom),]
+  pdat = bind_rows(pdat, tibble(m=TRUE, x = "T", loc = max.t.tom, dens = t_x_pos + centre_width/2))
+  
+  min.t.tom = min(dpt[tomato & experiment == "T"])
+  pdat = pdat[-which(pdat$m & pdat$x == "T" & pdat$loc < min.t.tom),]
+  pdat = bind_rows(pdat, tibble(m=TRUE, x = "T", loc = min.t.tom, dens = t_x_pos + centre_width/2))
+  
+  max.t.not = max(dpt[!tomato & experiment == "T"])
+  pdat = pdat[-which(!pdat$m & pdat$x == "T" & pdat$loc > max.t.not),]
+  pdat = bind_rows(pdat, tibble(m=FALSE, x = "T", loc = max.t.not, dens = t_x_pos - centre_width/2))
+  
+  min.t.not = min(dpt[!tomato & experiment == "T"])
+  pdat = pdat[-which(!pdat$m & pdat$x == "T" & pdat$loc < min.t.not),]
+  pdat = bind_rows(pdat, tibble(m=FALSE, x = "T", loc = min.t.not, dens = t_x_pos - centre_width/2))
+  
+
+  p = ggplot(pdat, aes(dens, loc, fill = m, group = interaction(m, x))) + 
+    geom_rect(data = rect_annot,
+              inherit.aes = FALSE,
+              mapping = aes(ymin = start, 
+                            ymax = end, 
+                            xmin = 0 - centre_width/2, 
+                            xmax = 0 + centre_width/2, 
+                            fill = call)) +
+    geom_rect(data = rect_annot,
+              inherit.aes = FALSE,
+              mapping = aes(ymin = start, 
+                            ymax = end, 
+                            xmin = t_x_pos - centre_width/2, 
+                            xmax = t_x_pos + centre_width/2, 
+                            fill = call)) +
+    geom_polygon() +
+    scale_x_continuous(breaks = c(0,t_x_pos), labels = c('WT', 'T')) +
+    ylab('DPT') +
+    theme(axis.title.x = element_blank()) +
+    scale_fill_manual(values = c(celltype_colours, "TRUE" = "red", "FALSE" = "black"), 
+                    labels = c(ct_labs, "TRUE" = "Tom+", "FALSE" = "Tom-"),
+                    name = "Celltype")
+  
+  return(p)
+}
+
+
+dpt_violins = pretty_plot(dpt = c(sub_wt_meta$dpt, sub_t_meta$dpt),
+            tomato = c(sub_wt_meta$tomato, sub_t_meta$tomato),
+            experiment = c(rep("WT", nrow(sub_wt_meta)), rep("T", nrow(sub_t_meta))),
+            t_x_pos = 1.5)
+
+dpt_violins
+ggsave(dpt_violins, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/nmp/plots/dpt_violins.pdf",
+       width = 6, height = 5)
+
+ggsave(dpt_violins, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/nmp/paper_figs/fig3_dpt_violins.pdf",
+       width = 6, height = 5)
+
+```
+
+```{r density-simple}
+
+
+p = ggplot(sub_t_meta, aes(x = dpt, col = tomato)) +
+  # geom_density(lwd = 1) +
+  geom_line(stat = "density", lwd = 1) +
+  scale_color_manual(
+    values = c("TRUE" = "red", "FALSE" = "black"),
+    labels = c("TRUE" = "Tomato+", "FALSE" = "Tomato-")) +
+  annotate_celltype() +
+  labs(x = "DPT ordering", y = "Density") +
+  theme(legend.position = "none")
+
+ggsave(p, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/nmp/paper_figs/fig3_tchim_dpt_density.pdf",
+       width = 6, height = 3)
+
+```
+
+Importantly, the wild-type chimaera cells are not distributed differently along this ordering (KS-test p = `r test.wt$p.value`), while the T chimaera cells are (KS-test p = `r test.t$p.value`)
+
+## Gene expression along the ordering
+
+What does the ordering represent?
+The expression levels of canonical marker genes in the atlas ordering are shown in Figure \@ref(fig:t-ordering).
+Here, the percentage of cells that express the gene was calculated for 100 evenly spaced bins across the DPT ordering (each bin extends across 10% of the full width of the trajectory, to ensure robust and smooth expression profiles).
+
+```{r t-ordering, fig.wide = FALSE, fig.cap = "Gene expression signatures of cell types along the ordering, showing fractions of cells expressing the gene."}
+
+
+makeGeneTraceWindow = function(
+  targets, 
+  nwindows = 100, 
+  sceobj = s1, 
+  dpt = dpt_vec, 
+  window_width_nwindows = 10, 
+  mode = c("detected", "meanlogcount")
+  ){
+
+  seq = seq(from = min(dpt), to = max(dpt), length.out = nwindows)
+  diff = (seq[2] - seq[1]) * window_width_nwindows
+
+  if(mode[1] == "detected"){
+
+    levels = sapply(targets, function(x){
+     ens = get_ensembl(x)
+     logical = as.logical(counts(sceobj[ens,])>0)
+     out = sapply(seq[c(-1, -length(seq))], function(y){
+       retain = dpt < y + diff & dpt > y - diff
+       return(sum(logical[retain])/sum(retain))
+     })
+     return(out)
+    })
+    ylab = "% cells expressing gene"
+  } else if(mode[1] == "meanlogcount"){
+    levels = sapply(targets, function(x){
+      ens = get_ensembl(x)
+      vals = as.numeric(logcounts(sceobj[ens,]))
+      out = sapply(seq[c(-1, -length(seq))], function(x){
+        retain = dpt < x + diff & dpt > x - diff
+        return(mean(vals[retain]))
+      })
+      return(out)
+    })
+    # levels = sweep(levels, 2, apply(levels, 2, max), "/")
+    ylab = "Mean log count"
+  } else {
+    stop("Mode isn't valid")
+  }
+
+  mlt = melt(levels)
+  names(mlt) = c("dpt", "gene", "value")
+  mlt$dpt = seq[mlt$dpt + 1]
+  
+  ngenes = length(unique(mlt$gene))
+  #remove yellow if odd number of colours, it's unreadable
+  #also, use a custom palette to extend possible number of colours
+  palette = switch(
+    ngenes%%2 + 1,
+    scale_color_manual(values = colorRampPalette(brewer_pal(palette = "Spectral")(11))(ngenes), name = ""),
+    scale_color_manual(values = colorRampPalette(brewer_pal(palette = "Spectral")(11))(ngenes + 1)[-median(1:(ngenes+1))], name = "")
+    )
+
+  p = ggplot(data = mlt, mapping = aes(x = dpt, y= value, col = gene, fill = gene)) +
+    geom_line(lwd = 1) +
+    palette +
+    labs(x = "DPT ordering", y = ylab) +
+    annotate_celltype(ymin = ifelse(mode[1] == "detected", -0.05, -0.25))
+
+    return(p)
+}
+
+targets = c("Sox2", "Nkx1-2", "T", "Tbx6", "Meox1")
+p = makeGeneTraceWindow(targets)
+p
+
+ggsave(p, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/nmp/paper_figs/fig3_atlas_genetrace_pctexpr.pdf",
+       width = 6, height = 3)
+```
+
+A similar pattern is observed when we consider the mean log count along the trajectory.
+
+```{r t-ordering-logcount, fig.wide = FALSE, fig.cap = "Gene expression signatures of cell types along the ordering, showing the mean log count."}
+
+p = makeGeneTraceWindow(targets, mode = "meanlogcount")
+p
+
+ggsave(p, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/nmp/paper_figs/fig3_atlas_genetrace_meanlogcount.pdf",
+       width = 6, height = 3)
+
+```
+
+Does the ordering encode any spatial information?
+The cell types concerned are found in the tail of the embryo - particularly the NMPs, which sit most caudally.
+The expression of homeobox transcription factors (*Hox* and *Cdx* genes) should identify such spatial patterns.
+The expression of selected genes are shown in Figure \@ref(fig:get-hox).
+
+```{r get-hox, fig.wide = TRUE, fig.height = 12, fig.cap = "Homeobox gene expression along the cell ordering."}
+
+targets = genes[grepl("Hox[a-d][0-9]+", genes[,2]),2]
+
+targets = c(targets, genes[grepl("Cdx", genes[,2]),2])
+number = regmatches(targets, regexpr("[0-9]+", targets))
+targets = targets[order(as.numeric(number))]
+plots = lapply(c(paste0("Hox", c("a","b","c","d")), "Cdx"),
+  function(x){
+    makeGeneTraceWindow(targets[grepl(x, targets)])#,  mode = "meanlogcount")
+  })
+
+
+plot_grid(plotlist = plots, ncol = 2)
+
+```
+
+This is shown as mean log-count in Figure \@ref(fig:get-hox-2)
+
+```{r get-hox-2, fig.wide = TRUE, fig.height = 12, fig.cap = "Homeobox gene expression along the cell ordering, by mean log-count."}
+
+plots = lapply(c(paste0("Hox", c("a","b","c","d")), "Cdx"),
+  function(x){
+    makeGeneTraceWindow(targets[grepl(x, targets)], mode = "meanlogcount")
+  })
+
+
+plot_grid(plotlist = plots, ncol = 2)
+
+ggsave(plots[[1]], file = "/nfs/research1/marioni/jonny/chimera-t/scripts/nmp/paper_figs/homeobox_hoxa.pdf",
+       width = 6, height = 4)
+
+```
+
+The highest expression of most genes (especially higher numbered, more caudally-expressed genes) is in the NMP region, with decreasing expression towards either end of the ordering.
+
+A selected set of homeobox genes is shown in Figure \@ref(fig:hox-selected).
+
+```{r hox-selected, fig.wide = TRUE, fig.height = 6, fig.cap = "Homeobox gene expression along the cell ordering, by mean log-count."}
+
+
+p = makeGeneTraceWindow(c("Hoxa1", "Hoxa2", "Hoxb2", "Hoxa5", "Cdx1", "Cdx2", "Cdx4"), mode = "meanlogcount")
+p
+ggsave(p, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/nmp/paper_figs/homeobox_trace_selected.pdf",
+       width = 6, height = 4)
+
+
+```
+
+Another selected set of homeobox genes is shown in Figure \@ref(fig:hox-selected2).
+
+```{r hox-selected2, fig.wide = TRUE, fig.height = 6, fig.cap = "Homeobox gene expression along the cell ordering, by mean log-count."}
+
+
+p = makeGeneTraceWindow(c("Hoxc9", "Hoxc8", "Hoxa9", "Hoxb4", "Hoxd4"), mode = "meanlogcount")
+p
+ggsave(p, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/nmp/paper_figs/homeobox_trace_selected2.pdf",
+       width = 6, height = 4)
+
+
+```
+
+### Gene expression in the chimera
+
+We can also show how the expression of different genes varies along the ordering in the chimera data.
+Comparing between the WT and T chimeras highlights the disregulation of development that is induced by the mutation.
+One example of this is in the gene *Sox2*, whose expression is shown in Figure \@ref(fig:trace-split).
+Similar disregulation will be the main focus of the next section of this document.
+
+```{r trace-split, fig.height = 8, fig.wide = TRUE, fig.cap = "Gene expression of Sox2 in chimeric embryos"}
+
+makeGeneTraceWindowSplit = function(gene, nwindows = 100, sceobj = s2, dpt = sub_t_meta$dpt, tomato = sub_t_meta$tomato, window_width_nwindows = 10, mode = c("detected", "meanlogcount")){
+  seq = seq(from = min(dpt), to = max(dpt), length.out = nwindows)
+  diff = (seq[2] - seq[1]) * window_width_nwindows
+
+
+  if(mode[1] == "detected"){
+    levels = sapply(unique(tomato), function(x){
+     ens = get_ensembl(gene)
+     logical = as.logical(counts(sceobj[ens,])>0)
+     out = sapply(seq[c(-1, -length(seq))], function(y){
+       retain = dpt < y + diff & dpt > y - diff & tomato == x
+       return(sum(logical[retain])/sum(retain))
+     })
+     return(out)
+    })
+    ylab = paste("% cells expressing", gene)
+  } else if(mode[1] == "meanlogcount"){
+    levels = sapply(unique(tomato), function(x){
+     ens = get_ensembl(gene)
+     vals = as.numeric(logcounts(sceobj[ens,]))
+     out = sapply(seq[c(-1, -length(seq))], function(y){
+       retain = dpt < y + diff & dpt > y - diff & tomato == x
+       return(mean(vals[retain]))
+     })
+     return(out)
+    })
+    ylab = paste(gene, "mean log-count")
+  } else {
+    stop("Mode isn't valid")
+  }
+  
+  colnames(levels) = unique(tomato)
+  mlt = melt(levels)
+  names(mlt) = c("dpt", "tomato", "value")
+  mlt$dpt = seq[mlt$dpt + 1]
+  
+
+
+  p = ggplot(data = mlt, mapping = aes(x = dpt, y= value, col = tomato)) +
+    geom_line(lwd = 1) +
+    scale_fill_brewer(palette = "Spectral") +
+    scale_color_manual(
+      values = c("TRUE" = "red", "FALSE" = "black"),
+      labels = c("TRUE" = "Tomato+", "FALSE" = "Tomato-"),
+      name = "") +
+    labs(x = "DPT ordering", y = ylab) +
+    annotate_celltype(ymin = ifelse(mode[1] == "detected", -0.05, -0.25)) +
+    ggtitle(gene)
+
+    return(p)
+}
+
+p1 = makeGeneTraceWindowSplit(
+  "Sox2", 
+  mode = "meanlogcount") +
+ggtitle("T chimera")
+
+p2 = makeGeneTraceWindowSplit(
+  "Sox2", 
+  sceobj = s3, 
+  tomato = sub_wt_meta$tomato, 
+  dpt = sub_wt_meta$dpt, 
+  mode = "meanlogcount") +
+  ggtitle("WT chimera")
+
+plot_grid(p1, p2, ncol = 1)
+
+genes_trace = c("Sox2", "Nkx1-2", "T", "Tbx6", "Rspo3", "Cyp26a1", "Aldh1a2")
+for(gene in genes_trace){
+  ggsave(
+    makeGeneTraceWindowSplit(gene), 
+    file = paste0("/nfs/research1/marioni/jonny/chimera-t/scripts/nmp/paper_figs/gene_trace/fig3_tchim_splittrace_",
+      gene,
+      "_pctexpr.pdf"),
+    width = 6, height = 3
+  )
+
+  ggsave(
+    makeGeneTraceWindowSplit(gene, mode = "meanlogcount"), 
+    file = paste0("/nfs/research1/marioni/jonny/chimera-t/scripts/nmp/paper_figs/gene_trace/fig3_tchim_splittrace_",
+      gene,
+      "_meanlogcount.pdf"),
+    width = 6, height = 3
+  )
+
+  ggsave(
+    makeGeneTraceWindowSplit(gene, sceobj = s3, dpt = sub_wt_meta$dpt, tomato = sub_wt_meta$tomato), 
+    file = paste0("/nfs/research1/marioni/jonny/chimera-t/scripts/nmp/paper_figs/gene_trace/fig3_wtchim_splittrace_",
+      gene,
+      "_pctexpr.pdf"),
+    width = 6, height = 3
+  )
+
+    ggsave(
+    makeGeneTraceWindowSplit(gene, sceobj = s3, dpt = sub_wt_meta$dpt, tomato = sub_wt_meta$tomato, mode= "meanlogcount"), 
+    file = paste0("/nfs/research1/marioni/jonny/chimera-t/scripts/nmp/paper_figs/gene_trace/fig3_wtchim_splittrace_",
+      gene,
+      "_meanlogcount.pdf"),
+    width = 6, height = 3
+  )
+}
+
+```
+
+## Sox2/T coexpression between chimaeras
+
+Another consideration concerning this data is whether the NMPs in the T knockout background are "really" NMPs. 
+We will assess this by considering the coexpression of T and Sox2 in the cells shown in visualisations above.
+First, we consider the expression of each gene separately.
+
+```{r, fig.wide = TRUE, fig.height = 10}
+
+makeTwoGeneTrace = function(gene1 = "T", gene2 = "Sox2", nwindows = 100, sceobj = s2, dpt = sub_t_meta$dpt, tomato = sub_t_meta$tomato, window_width_nwindows = 10, mode = c("detected", "meanlogcount"), title = ""){
+  seq = seq(from = min(dpt), to = max(dpt), length.out = nwindows)
+  diff = (seq[2] - seq[1]) * window_width_nwindows
+
+
+  if(mode[1] == "detected"){
+    levels_g1 = sapply(unique(tomato), function(x){
+     ens = get_ensembl(gene1)
+     logical = as.logical(counts(sceobj[ens,])>0)
+     out = sapply(seq[c(-1, -length(seq))], function(y){
+       retain = dpt < y + diff & dpt > y - diff & tomato == x
+       return(sum(logical[retain])/sum(retain))
+     })
+     return(out)
+    })
+    levels_g2 = sapply(unique(tomato), function(x){
+     ens = get_ensembl(gene2)
+     logical = as.logical(counts(sceobj[ens,])>0)
+     out = sapply(seq[c(-1, -length(seq))], function(y){
+       retain = dpt < y + diff & dpt > y - diff & tomato == x
+       return(sum(logical[retain])/sum(retain))
+     })
+     return(out)
+    })
+    ylab = "% cells expressing"
+  } else if(mode[1] == "meanlogcount"){
+    levels_g1 = sapply(unique(tomato), function(x){
+     ens = get_ensembl(gene1)
+     vals = as.numeric(logcounts(sceobj[ens,]))
+     out = sapply(seq[c(-1, -length(seq))], function(y){
+       retain = dpt < y + diff & dpt > y - diff & tomato == x
+       return(mean(vals[retain]))
+     })
+     return(out)
+    })
+    levels_g2 = sapply(unique(tomato), function(x){
+     ens = get_ensembl(gene2)
+     vals = as.numeric(logcounts(sceobj[ens,]))
+     out = sapply(seq[c(-1, -length(seq))], function(y){
+       retain = dpt < y + diff & dpt > y - diff & tomato == x
+       return(mean(vals[retain]))
+     })
+     return(out)
+    })
+    ylab = "Mean log-count"
+  } else {
+    stop("Mode isn't valid")
+  }
+  
+  colnames(levels_g1) = paste0(unique(tomato), "_", gene1)
+  colnames(levels_g2) = paste0(unique(tomato), "_", gene2)
+  mlt = melt(cbind(levels_g1, levels_g2))
+  names(mlt) = c("dpt", "id", "value")
+  mlt$dpt = seq[mlt$dpt + 1]
+  mlt$tomato = grepl("^TRUE", mlt$id)
+  mlt$gene1 = grepl(paste0(gene1, "$"), mlt$id)
+  
+
+
+  p = ggplot(data = mlt, mapping = aes(x = dpt, y= value, col = tomato)) +
+    geom_line(lwd = 1, mapping = aes(lty = gene1)) +
+    scale_fill_brewer(palette = "Spectral") +
+    scale_color_manual(
+      values = c("TRUE" = "red", "FALSE" = "black"),
+      labels = c("TRUE" = "Tomato+", "FALSE" = "Tomato-"),
+      name = "Injected") +
+    scale_linetype(
+      labels = c("TRUE" = gene1, "FALSE" = gene2),
+      name = "Gene") +
+    labs(x = "DPT ordering", y = ylab) +
+    annotate_celltype(ymin = ifelse(mode[1] == "detected", -0.05, -0.25)) +
+    ggtitle(title)
+
+    return(p)
+}
+
+coexp_t = makeTwoGeneTrace(title = "T chimaeras")
+coexp_wt = makeTwoGeneTrace(title = "WT chimaeras", sceobj = s3, dpt = sub_wt_meta$dpt, tomato = sub_wt_meta$tomato)
+grid = plot_grid(coexp_t, coexp_wt, ncol = 1)
+grid
+ggsave(grid, file = "plots/chimera_t_sox2_twogenetrace.pdf", width = 7, height = 8)
+```
+
+```{r, fig.wide = TRUE, fig.height = 10}
+
+makeCoexpTrace = function(gene1 = "T", gene2 = "Sox2", nwindows = 100, sceobj = s2, dpt = sub_t_meta$dpt, tomato = sub_t_meta$tomato, window_width_nwindows = 10, title = ""){
+  seq = seq(from = min(dpt), to = max(dpt), length.out = nwindows)
+  diff = (seq[2] - seq[1]) * window_width_nwindows
+
+
+  levels = sapply(unique(tomato), function(x){
+    ens1 = get_ensembl(gene1)
+    ens2 = get_ensembl(gene2)
+    logical = as.logical(counts(sceobj[ens1,])>0 & counts(sceobj[ens2,])>0)
+    out = sapply(seq[c(-1, -length(seq))], function(y){
+      retain = dpt < y + diff & dpt > y - diff & tomato == x
+      return(sum(logical[retain])/sum(retain))
+    })
+    return(out)
+  })
+
+  ylab = "% cells coexpressing"
+  
+  colnames(levels) = unique(tomato)
+  mlt = melt(levels)
+  names(mlt) = c("dpt", "tomato", "value")
+  mlt$dpt = seq[mlt$dpt + 1]
+
+  p = ggplot(data = mlt, mapping = aes(x = dpt, y= value, col = tomato)) +
+    geom_line(lwd = 1) +
+    scale_fill_brewer(palette = "Spectral") +
+    scale_color_manual(
+      values = c("TRUE" = "red", "FALSE" = "black"),
+      labels = c("TRUE" = "Tomato+", "FALSE" = "Tomato-"),
+      name = "Injected") +
+    labs(x = "DPT ordering", y = ylab) +
+    annotate_celltype(ymin = -0.05) +
+    ggtitle(title)
+
+    return(p)
+}
+
+coexp_t = makeCoexpTrace(title = "T chimaeras")
+coexp_wt = makeCoexpTrace(title = "WT chimaeras", sceobj = s3, dpt = sub_wt_meta$dpt, tomato = sub_wt_meta$tomato)
+grid = plot_grid(coexp_t, coexp_wt, ncol = 1)
+grid
+ggsave(grid, file = "plots/chimera_t_sox2_coexp_trace.pdf", width = 7, height = 8)
+```
+
+We can alternatively produce scatter plots of expression of the two genes in NMP-mapped cells from each background.
+
+```{r}
+t_df = data.frame(
+  T = logcounts(sce)[match("T", genes[,2]), meta$celltype.mapped == "NMP"],
+  Sox2 = logcounts(sce)[match("Sox2", genes[,2]), meta$celltype.mapped == "NMP"],
+  chimera = "T",
+  tomato = ifelse(meta$tomato[meta$celltype.mapped == "NMP"], "Injected", "Host")
+)
+
+wt_df = data.frame(
+  T = logcounts(wt_sce)[match("T", genes[,2]), wt_meta$celltype.mapped == "NMP"],
+  Sox2 = logcounts(wt_sce)[match("Sox2", genes[,2]), wt_meta$celltype.mapped == "NMP"],
+  chimera = "WT",
+  tomato = ifelse(wt_meta$tomato[wt_meta$celltype.mapped == "NMP"], "Injected", "Host")
+)
+
+df = rbind(wt_df, t_df)
+
+p = ggplot(df, aes(x = Sox2, y = T, col = tomato)) +
+  geom_point(size = 0.5) +
+  labs(x = "Sox2 logcount", y = "T logcount") +
+  facet_grid(tomato~chimera) +
+  theme(legend.position = "none") +
+  scale_colour_manual(values = c("Injected" = "red", "Host" = "black"))
+p
+
+ggsave(p, file = "plots/chimera_t_sox2_coexpression_scatter.pdf", width = 5, height = 5)
+```
+
+# Lack of neural committment in KO
+
+Based on previous claims from the literature, we would expect to see that T-knockout cells would show a bias towards a neural fate.
+Do we observe this?
+
+```{r}
+makeGeneTraceWindowSplit_override = function(logcounts, gene, nwindows = 100, sceobj = s2, dpt = sub_t_meta$dpt, tomato = sub_t_meta$tomato, window_width_nwindows = 10, mode = c("detected", "meanlogcount")){
+  seq = seq(from = min(dpt), to = max(dpt), length.out = nwindows)
+  diff = (seq[2] - seq[1]) * window_width_nwindows
+
+
+  if(mode[1] == "detected"){
+    levels = sapply(unique(tomato), function(x){
+     ens = get_ensembl(gene)
+     logical = as.logical(logcounts>0)
+     out = sapply(seq[c(-1, -length(seq))], function(y){
+       retain = dpt < y + diff & dpt > y - diff & tomato == x
+       return(sum(logical[retain])/sum(retain))
+     })
+     return(out)
+    })
+    ylab = paste("% cells expressing", gene)
+  } else if(mode[1] == "meanlogcount"){
+    levels = sapply(unique(tomato), function(x){
+     ens = get_ensembl(gene)
+     vals = logcounts
+     out = sapply(seq[c(-1, -length(seq))], function(y){
+       retain = dpt < y + diff & dpt > y - diff & tomato == x
+       return(mean(vals[retain]))
+     })
+     return(out)
+    })
+    ylab = paste(gene, "mean log-count")
+  } else {
+    stop("Mode isn't valid")
+  }
+  
+  colnames(levels) = unique(tomato)
+  mlt = melt(levels)
+  names(mlt) = c("dpt", "tomato", "value")
+  mlt$dpt = seq[mlt$dpt + 1]
+  
+
+
+  p = ggplot(data = mlt, mapping = aes(x = dpt, y= value, col = tomato)) +
+    geom_line(lwd = 1) +
+    scale_fill_brewer(palette = "Spectral") +
+    scale_color_manual(
+      values = c("TRUE" = "red", "FALSE" = "black"),
+      labels = c("TRUE" = "Tomato+", "FALSE" = "Tomato-"),
+      name = "") +
+    labs(x = "DPT ordering", y = ylab) +
+    annotate_celltype(ymin = ifelse(mode[1] == "detected", -0.05, -0.25)) +
+    ggtitle(gene)
+
+    return(p)
+}
+non_sox2_signature = c("Sox1", "Sox3", "Sox21", "Sp8", "Zic1", "Zic2", "Zic3", "Irx1", "Irx3", "Irx5", "Nkx6-1", "Olig2", "Olig3", "Pax3", "Pax6")
+
+# p = makeGeneTraceWindowSplit_override(as.numeric(logcounts(s2[match("Sox2", genes[,2]),])), "Sox2")
+p = makeGeneTraceWindowSplit(gene = "Sox2")
+ggsave(p, file = "plots/gene_trace_tchim_sox2.pdf", width = 5, height = 4)
+
+pgrid = plot_grid(plotlist = lapply(non_sox2_signature, makeGeneTraceWindowSplit))
+ggsave(pgrid, file = "plots/gene_trace_tchim_non-sox2_grid.pdf", width = 16, height = 12)
+
+p = makeGeneTraceWindowSplit_override(as.numeric(Matrix::colSums(logcounts(s2[match(non_sox2_signature, genes[,2]),]))), "Non-Sox2 neural sig.")
+ggsave(p, file = "plots/gene_trace_tchim_non-sox2_summed.pdf", width = 5, height = 4)
+
+
+p = makeGeneTraceWindowSplit(gene = "Sox2", sceobj = s3, dpt = sub_wt_meta$dpt, tomato = sub_wt_meta$tomato)
+ggsave(p, file = "plots/gene_trace_wtchim_sox2.pdf", width = 5, height = 4)
+
+pgrid = plot_grid(plotlist = lapply(non_sox2_signature, makeGeneTraceWindowSplit, sceobj = s3, dpt = sub_wt_meta$dpt, tomato = sub_wt_meta$tomato))
+ggsave(pgrid, file = "plots/gene_trace_wtchim_non-sox2_grid.pdf", width = 16, height = 12)
+
+p = makeGeneTraceWindowSplit_override(as.numeric(Matrix::colSums(logcounts(s3[match(non_sox2_signature, genes[,2]),]))), "Non-Sox2 neural sig.", sceobj = s3, dpt = sub_wt_meta$dpt, tomato = sub_wt_meta$tomato)
+ggsave(p, file = "plots/gene_trace_wtchim_non-sox2_summed.pdf", width = 5, height = 4)
+```
+
+```{r}
+df_t = do.call(rbind, lapply(non_sox2_signature, function(x){
+    data.frame(
+      gene = x,
+      expr = logcounts(sce)[match(x, genes[,2]), meta$celltype.mapped == "NMP"],
+      chimera = "T",
+      tomato = ifelse(meta$tomato[meta$celltype.mapped == "NMP"], "Injected", "Host")
+)}))
+df_wt = do.call(rbind, lapply(non_sox2_signature, function(x){
+    data.frame(
+      gene = x,
+      expr = logcounts(wt_sce)[match(x, genes[,2]), wt_meta$celltype.mapped == "NMP"],
+      chimera = "WT",
+      tomato = ifelse(wt_meta$tomato[wt_meta$celltype.mapped == "NMP"], "Injected", "Host")
+)}))
+
+p = ggplot(rbind(df_t, df_wt), mapping = aes(x = gene, y = expr, fill = tomato)) +
+  geom_violin(alpha = 0.6, scale = "width") +
+  scale_fill_manual(values = c("Host" = "black", "Injected" = "red"), name = "") +
+  facet_wrap(~chimera, ncol = 1) +
+  labs(y = "logcount") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5),
+        axis.title.x = element_blank())
+ggsave(p, file = "plots/sox2_sensitivity_violin.pdf", width = 7, height = 5)
+```
+
+# Identifying disregulation at the blockage point
+
+To identify what genetic disregulation is taking place in the *T* knockout cells, we have performed differential expression analyses.
+We consider two comparisons: first, we identify which genes are typically upregulated as NMPs commit to presomitic mesoderm; here, we use the WT cells from the *T* chimaeras.
+Second, we consider which genes are differentially expressed between Tomato+ and Tomato- cells at the apparent blockage point of the Tomato+ cells.
+The intersection of these differentially expressed genes should reveal which NMP-relevant genes are disregulated by the knockout of *T*.
+
+In the first comparison, we needed to identify Tomato- cells that are in the bipotent NMP state (characterised by *Nkx1.2* expression) with those that had committed to a somitic identity.
+Bipotent cells were identified according to a window along DPT, shown in Figure \@ref(fig:bipot)
+
+```{r bipot, fig.wide = TRUE, fig.cap = "Densities of the cells that express both T and Sox2 are shown along DPT in the wild-type chimaera cells. We have selected the cells with DPT values highlighted in the gold box as the bipotent NMPs."}
+
+#alternative provides v similar results
+# bipot_mark = as.logical(counts(s2[match("T", genes[,2]), !sub_t_meta$tomato]) > 0 & 
+#   counts(s2[match("Sox2", genes[,2]), !sub_t_meta$tomato]))
+
+bipot_mark = as.logical(counts(s2[match("Nkx1-2", genes[,2]), !sub_t_meta$tomato]) > 0)
+
+bipot.min = 1
+bipot.max = 1.25
+
+bipot = ggplot(sub_t_meta[!sub_t_meta$tomato,], aes(x = dpt, fill = bipot_mark)) +
+  geom_histogram(bins = 50, mapping = aes(y = ..density..)) +
+  geom_rect(data = data.frame(xmin = bipot.min,
+                              xmax = bipot.max,
+                              ymin = 0,
+                              ymax = 4),
+            mapping = aes(xmin = xmin, ymin = ymin, ymax = ymax, xmax = xmax),
+            col = "black",
+            fill = "darkgrey",
+            alpha = 0.5,
+            inherit.aes = FALSE) +
+  scale_fill_manual(values = c("TRUE" = "coral", "FALSE" = "lightgrey", celltype_colours),
+                     name="",
+                     labels = c("TRUE" = "Nkx1.2+",
+                                "FALSE" = "Nkx1.2-"),
+                    breaks = c("TRUE", "FALSE")) +
+  geom_rect(data = annot, mapping = aes(xmin = start, xmax = end, ymin = -0.5, ymax = 0, fill = call),
+            inherit.aes = FALSE) +
+  labs(x = "DPT", y= "Density") +
+  theme(legend.position = c(0.6, 0.8))
+
+bipot
+
+```
+
+The second group of cells were those that had committed towards somitic mesoderm. Those were selected according to Figure \@ref(fig:de)a.
+Next, we identified the blockage point of the Tomato+ cells, as identified in previous sections.
+We considered all cells with DPT values between the bipotent NMP state and the committed somitic state.
+These three groups of cells are shown in the violin plot in Figure \@ref(fig:de)a (group 1), and the UMAP in Figure \@ref(fig:de)b.
+
+```{r de, fig.height = 10, fig.wide = FALSE, fig.cap = "Cells selected for DE. a, Cells selected according to DPT ordering. Each side of the violin shows the density of cells in either the Tomato+ or Tomato- fractions. The coloured rectangle in the centre is a sliding window over the atlas DPT values, where the colour corresponds to the most frequent cell type label observed in the window. b, Cells selected as shown in the T chimera UMAP.", warning = FALSE}
+
+sub_wt_meta$tomatoText = ifelse(sub_wt_meta$tomato, "Tom+", "Tom-")
+meta$tomatoText = ifelse(meta$tomato, "Tomato+", "Tomato-")
+
+somite.min = 1.6
+somite.max = 2
+
+cross.min = bipot.max
+cross.max = somite.min
+
+# dcars_meta = sub_t_meta[sub_t_meta$dpt < along1.max & sub_t_meta$dpt > along2.min,]
+# dcars_sce = scater::normalize(sce[,match(dcars_meta$cell, colnames(sce))])
+# dcars_wt_meta = sub_wt_meta[sub_wt_meta$dpt < along1.max & sub_wt_meta$dpt > along2.min,]
+# dcars_wt_sce = scater::normalize(wt_sce[,match(dcars_wt_meta$cell, colnames(wt_sce))])
+# save(dcars_meta, dcars_sce, dcars_wt_meta, dcars_wt_sce, file = "~/Desktop/dcars_bra.RData")
+
+p1= pretty_plot(dpt = c(sub_wt_meta$dpt, sub_t_meta$dpt),
+            tomato = c(sub_wt_meta$tomato, sub_t_meta$tomato),
+            experiment = c(rep("WT", nrow(sub_wt_meta)), rep("T", nrow(sub_t_meta)))) +
+  #boxes for categories
+  geom_rect(inherit.aes = FALSE, 
+            mapping = aes(xmin = 1.5, xmax = 1.95,
+                          ymin = cross.min, ymax = cross.max),
+            alpha = 0.02, fill = "darkgrey", col = "black") +
+  geom_rect(inherit.aes = FALSE, 
+            mapping = aes(xmin = 2.05, xmax = 3.2,
+                          ymin = cross.min, ymax = cross.max),
+            alpha = 0.02, fill = "darkgrey", col = "black") +
+  geom_rect(inherit.aes = FALSE, 
+            mapping = aes(xmin = 1.4, xmax = 1.95,
+                          ymin = bipot.max, ymax = bipot.min),
+            alpha = 0.02, fill = celltype_colours["NMP"], col = "black") +
+  geom_rect(inherit.aes = FALSE, 
+            mapping = aes(xmin = 1.4, xmax = 1.95,
+                          ymin = somite.min, ymax = somite.max),
+            alpha = 0.02, fill = celltype_colours["Somitic mesoderm"], col = "black") +
+  #lines across
+  geom_line(data = data.frame(), mapping = aes(x = c(1.9, 2.75), y = mean(c(cross.min, cross.max))),
+            inherit.aes = FALSE,
+            arrow = arrow(ends = "both", length = unit(0.1, "inches")),
+            lwd = 1) +
+  geom_text(data = data.frame(),
+             mapping = aes(x = 2.25, y = mean(c(cross.min, cross.max))),
+             label = "T knockout\neffect",
+             inherit.aes = FALSE,
+            nudge_y = 0.5, nudge_x = 0.2) +
+  #lines along
+  geom_line(data = data.frame(), mapping = aes(x = 1.45, 
+                                               y = c(mean(c(bipot.min, bipot.max)),
+                                                     mean(c(somite.min, somite.max)))),
+            inherit.aes = FALSE,
+            arrow = arrow(ends = "both", length = unit(0.1, "inches")),
+            lwd = 1) +
+  geom_text(data = data.frame(),
+             mapping = aes(x = 1.65, y = mean(c(somite.min, bipot.max))),
+             label = "Normal\ndevelopment",
+             inherit.aes = FALSE,
+            nudge_x = -0.5, nudge_y = 0.1, angle = 90) +
+  coord_cartesian(xlim = c(1.3, 3.2)) +
+  theme(legend.position = "none",
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.title.x = element_blank()) + 
+  coord_cartesian(xlim = c(0.9, 3.5))
+
+
+meta$group = sapply(meta$cell, function(x){
+  if(!x %in% sub_t_meta$cell){
+    return("Other")
+  } else {
+    dpt = sub_t_meta$dpt[match(x, sub_t_meta$cell)]
+    if(dpt < cross.max & dpt > cross.min){
+      return("Tom+Tom-")
+    } else if(dpt < bipot.max & 
+              dpt > bipot.min &
+              !sub_t_meta$tomato[sub_t_meta$cell == x]){
+      return("NMP")
+    } else if(dpt < somite.max & 
+              dpt > somite.min &
+              !sub_t_meta$tomato[sub_t_meta$cell == x]){
+      return("Somite")
+    } else {
+    return("Other")
+  }
+}})
+
+saveRDS(meta, file = "meta_with_de_groups.rds")
+
+meta$group = factor(meta$group, levels = c("Other", "Somite", "NMP", "Tom+Tom-"), ordered = TRUE)
+ord = order(meta$group)
+p2 = ggplot(meta[ord,], aes(x = umap_chimera$V1[ord], y = umap_chimera$V2[ord], col = group)) +
+  geom_point() +
+  scale_color_manual(values = c("Other" = "darkgrey",
+                                "Somite" = as.character(celltype_colours["Somitic mesoderm"]),
+                                "NMP" = as.character(celltype_colours["NMP"]),
+                                "Tom+Tom-" = "coral"),
+                     name = "DE group") +
+  facet_wrap(~tomatoText) +
+  theme(axis.ticks = element_blank(),
+        axis.text = element_blank()) +
+  guides(colour = guide_legend(override.aes = list(size=5))) +
+  labs(x = "UMAP1", y = "UMAP2")
+
+
+grid = plot_grid(p1, p2, ncol = 1, labels = "auto")
+
+grid
+
+grid = plot_grid(plot_grid(bipot, p1, labels = "auto", align = "h"), p2, plot_expr_split("Cyp26a1") + theme(plot.title = element_blank()), ncol = 1, labels = c("", "c", "d"))
+
+
+save_plot(grid, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/nmp/plots/de_selection.pdf",
+          base_width = 7, base_height = 9)
+
+```
+
+Note that the cross-background DE cell selection is consistent with the group of cells that show considerable neighbour bias for Tomato+ cells, as shown in Figure \@ref(fig:plot-voting), reproduced below in Figure \@ref(fig:plot-voting2)
+
+```{r plot-voting2, fig.cap = "Chimera cells projected in UMAP, coloured by the fraction of their 20 nearest neighbours that are Tomato positive."}
+
+pbias
+
+```
+
+Now, we perform differential expression testing between Tomato+ and Tomato- cells at the blockage point.
+The results are summarised in Figure \@ref(fig:do-de).
+
+```{r trim-de-function}
+
+#Removes the genes that are also DE in the same direction
+#in the same WT comparison
+getTrimmedDE = function(
+  t_sce, t_clusters, t_dpt=NULL, t_pools, 
+  wt_sce, wt_clusters, wt_dpt=NULL, wt_pools, 
+  base_cluster = "FALSE", dpt = TRUE, 
+  lfc = NULL, lfc_wt = 0.25){
+
+  if(dpt){
+    de_t = de_along_dpt(
+      x = t_sce, 
+      clusters = t_clusters, 
+      pools = t_pools,
+      dptval = t_dpt,
+      reference_cluster = base_cluster,
+      lfc = lfc
+      )
+    de_wt = de_along_dpt(
+      x = wt_sce, 
+      clusters = wt_clusters, 
+      pools = wt_pools,
+      dptval = wt_dpt,
+      reference_cluster = base_cluster,
+      lfc = lfc_wt
+      )
+  } else {
+    de_t = de_no_dpt(
+      x = t_sce, 
+      clusters = t_clusters, 
+      pools = t_pools,
+      reference_cluster = base_cluster,
+      lfc = lfc
+      )
+    de_wt = de_no_dpt(
+      x = wt_sce, 
+      clusters = wt_clusters, 
+      pools = wt_pools,
+      reference_cluster = base_cluster,
+      lfc = lfc_wt
+      )
+  }
+
+  hits_t = de_t[de_t$FDR < 0.1,]
+  hits_wt = de_wt[de_wt$FDR < 0.1,]
+
+  matched = sapply(rownames(hits_t), function(x){
+    if(x %in% rownames(hits_wt)){
+      if(sign(hits_wt[x,"logFC"]) == sign(hits_t[x,"logFC"])){
+        return(TRUE)
+      } else {
+        return(FALSE)
+      }
+    } else {
+      return(FALSE)
+    }
+  })
+  names(matched) = rownames(hits_t)
+
+  out = de_t[!rownames(de_t) %in% names(matched)[matched],]
+  out$FDR = p.adjust(out$PValue, method = "fdr")
+  out$mgi = get_mgi(rownames(out))
+
+  return(out)
+
+
+}
+
+```
+
+```{r do-de,fig.wide = FALSE, fig.height=5, fig.cap = "Summary of DE results for the blockage point comparison. Genes coloured in red were significantly DE (BH-corrected p<0.1). A number of points are labelled, with an arbitrary threshold chosen on logFC."}
+
+#subset to HVGs along trajectory
+de_hvgs = getHVGs(scater::normalize(sce[, meta$celltype.mapped %in% keep_celltypes]))
+expr_genes = calcAverage(scater::normalize(sce[, meta$celltype.mapped %in% keep_celltypes]))
+expr_genes = names(expr_genes)[expr_genes > 0.1]
+de_hvgs = de_hvgs[de_hvgs %in% expr_genes]
+
+#DE between Tom+Tom-
+sub_between = scater::normalize(sce[,match(sub_t_meta$cell[sub_t_meta$dpt < cross.max &
+                                                            sub_t_meta$dpt > cross.min],
+                                          colnames(sce))])
+sub_between_meta = sub_t_meta[match(colnames(sub_between), sub_t_meta$cell),]
+# de_between = findMarkers(
+#   x = sub_between,#[calcAverage(sub_between) > 0.1,], 
+#   clusters = sub_between_meta$tomato)#,
+#   # design = model.matrix(~sub_between_meta$dpt) )
+de_between = de_along_dpt(
+  x = sub_between, 
+  clusters = sub_between_meta$tomato, 
+  pools = sub_between_meta$pool, 
+  dptval = sub_between_meta$dpt,
+  reference_cluster = "FALSE",
+  lfc = 0.5
+  )
+de_between$FDR = p.adjust(de_between$PValue, method = "fdr")
+
+# hits_old = rownames(de_between$`TRUE`)[ de_between$`TRUE`$FDR < 0.1 ]
+# de_between_new$FDR = p.adjust(de_between_new$PValue, method = "fdr")
+# hits_new = rownames(de_between_new)[de_between_new$FDR < 0.1]
+
+labs_between = de_between[de_between$logFC < -1.75 | de_between$logFC > 1.2,]
+labs_between$mgi = get_mgi(rownames(labs_between))
+
+ggplot(as.data.frame(de_between), aes(x = logFC, y = -log10(PValue), col = FDR < 0.1)) +
+  geom_point() +
+  scale_color_manual(values = c("TRUE" = "red", "FALSE" = "black")) +
+  labs(x = "log2FC(Tom+/Tom-)", y = "-log10(p)")  +
+  geom_label_repel(data = as.data.frame(labs_between), 
+                   mapping = aes(x = logFC, y = -log10(PValue),
+                                 label = mgi), inherit.aes = FALSE,
+                   min.segment.length = 0) +
+  ggtitle("Blockage point DE")
+
+
+
+
+```
+
+However, *T* knockout is confounded with injected cell status.
+Therefore any differences innate to the chimaera (e.g. imprinting --- all the injected cells are male) may also be captured in this comparison.
+To exclude these genes from any significant DE gene lists, weuse the wild-type chimera data. 
+The results of such a DE comparison is shown in Figure \@ref(fig:do-de-wt), where we have repeated the DE test shown for the *T* chimeras, instead for the wild-type chimaera.
+Note that there are significantly DE genes even though we would expect no disregulation in NMP formation.
+
+```{r do-de-wt,fig.wide = FALSE, fig.height=6, fig.cap = "Summary of DE results for comparison 2, in the wild-type chimeras. Genes coloured in red were significantly DE (BH-corrected p<0.1). A number of points are labelled, with an arbitrary threshold chosen on logFC."}
+
+
+#DE between Tom+Tom-
+sub_between_wt = scater::normalize(wt_sce[,match(sub_wt_meta$cell[sub_wt_meta$dpt <= cross.max &
+                                                            sub_wt_meta$dpt >= cross.min],
+                                          colnames(wt_sce))])
+sub_between_meta_wt = sub_wt_meta[match(colnames(sub_between_wt), sub_wt_meta$cell),]
+# de_between_wt = findMarkers(sub_between_wt,#[calcAverage(sub_between) > 0.1,], 
+#                          clusters = sub_between_meta_wt$tomato)
+de_between_wt = de_along_dpt(
+  x = sub_between_wt, 
+  clusters = sub_between_meta_wt$tomato, 
+  pools = sub_between_meta_wt$pool, 
+  dptval = sub_between_meta_wt$dpt,
+  reference_cluster = "FALSE",
+  lfc = 0.5
+  )
+de_between_wt$FDR = p.adjust(de_between_wt$PValue, method = "fdr")
+
+
+
+labs_between_wt = de_between_wt[de_between_wt$logFC < -1.5 | de_between_wt$logFC > 1.5,]
+labs_between_wt$mgi = get_mgi(rownames(labs_between_wt))
+
+ggplot(as.data.frame(de_between_wt), aes(x = logFC, y = -log10(PValue), col = FDR < 0.1)) +
+  geom_point() +
+  scale_color_manual(values = c("TRUE" = "red", "FALSE" = "black")) +
+  labs(x = "log2FC(Tom+/Tom-)", y = "-log10(p)")  +
+  geom_label_repel(data = as.data.frame(labs_between_wt), 
+                   mapping = aes(x = logFC, y = -log10(PValue),
+                                 label = mgi), inherit.aes = FALSE,
+                   min.segment.length = 0) +
+  ggtitle("Blockage point DE,\nwild-type chimaera")
+
+
+hits_wt = de_between_wt[de_between_wt$FDR < 0.1,]
+hits_t = de_between[de_between$FDR < 0.1,]
+intersect = intersect(rownames(hits_wt), rownames(hits_t))
+agree = sapply(intersect, function(x) sign(hits_wt[x, "logFC"]) == sign(hits_t[x, "logFC"]))
+names(agree) = get_mgi(names(agree))
+agree = agree[agree]
+
+
+```
+
+`r length(agree)` genes were significantly DE (BH-adjusted p<0.1) in the same direction in both the WT and T chimeras in these comparisons. 
+These should be excluded from downstream comparisons that we make in the *T* chimaeras.
+For example, in this comparison, these genes were `r paste(names(agree), collapse = ", ")`.
+
+Specifically, I specify a procedure for DE testing in our data as follows:
+
+1. We perform differential expression testing in the *T* chimaeras using *edgeR*. 
+
+* The model matrix used contains covariates for the embryo pool, and the feature tested against (e.g., Tomato status.)
+
+* The model matrix also includes a term for the DPT value of each cell. 
+This is to avoid the effects of the developmental blockages that have been observed above.
+That is, inclusion of the term effectively results in testing between Tomato+ and Tomato- cells given their developmental status, rather than simply identifying that Tomato+ cells are blocked at an earlier state than the Tomato- cells
+
+* All genes were tested against a log2 fold change of 0.5 using the TREAT method (`edgeR::glmTreat`).
+This helps to ensure sparsity in the DE gene list without needing to filter based on some overall variance or gene expression level.
+
+2. The same differential testing procedure was performed on the wild-type chimaeras as in 1. is performed, except:
+
+* TREAT was run against a logFC threshold of 0.
+This is a more generous approach for identifying genes that were DE in the wild-type chimaeras due to the confounding of injection.
+
+3. Genes that significantly DE in both steps 1. and 2., and had logFC of the same sign, were excluded from the *T* chimaera DE gene list
+
+4. Significantly DE genes were reported as those with an FDR-adjusted p<0.1.
+
+The results of this procedure, performed at the blockage point, are shown in Figure \@ref(fig:get-blockage-de).
+
+```{r get-blockage-de, message = FALSE, fig.cap = "Summary of DE results for the blockage-point comparison. Genes coloured in red were significantly DE (BH-corrected p<0.1). A number of points are labelled, which were selected manually."}
+
+de_between = getTrimmedDE(
+  t_sce = sub_between, 
+  t_clusters = sub_between_meta$tomato, 
+  t_dpt = sub_between_meta$dpt,
+  t_pools = sub_between_meta$pool,
+  wt_sce = sub_between_wt, 
+  wt_clusters = sub_between_meta_wt$tomato, 
+  wt_dpt = sub_between_meta_wt$dpt,
+  wt_pools = sub_between_meta_wt$pool,
+  lfc = 0.5,
+  lfc_wt = 0.25
+  )
+
+write.table(de_between, 
+  file = "/nfs/research1/marioni/jonny/chimera-t/scripts/nmp/de_out/tchim_tom+blockage_tom-blockage.csv",
+  sep = ",",
+  col.names = TRUE, 
+  row.names = TRUE,
+  quote = FALSE)
+
+labs_between_t = de_between[get_ensembl(c("T", "Sox2", "Nkx2-1", "Cyp26a1", "Aldh1a2", "Hoxc9", "Hoxd9", "Hoxa5", "Dll1", "Hes3", "Fgf8", "Rspo3", "Fgf4", "Fgf3")),]
+
+
+ggplot(de_between, aes(x = logFC, y = -log10(PValue), col = FDR < 0.1)) +
+  geom_point(size=  0.6) +
+  scale_color_manual(values = c("TRUE" = "red", "FALSE" = "black")) +
+  labs(x = "log2FC(Tom+/Tom-)", y = "-log10(p)")  +
+  geom_label_repel(data = as.data.frame(labs_between_t), 
+                   mapping = aes(x = logFC, y = -log10(PValue),
+                                 label = mgi), inherit.aes = FALSE,
+                   min.segment.length = 0) +
+  ggtitle("Blockage point DE\n(WT chimaera genes removed)")
+
+
+```
+
+The top 40 most significantly DE genes are listed in table \@ref(tab:de-between-table).
+
+```{r de-between-table}
+kable(
+  de_between[order(de_between$FDR),][1:40, c("mgi", "logFC", "FDR")],
+  caption = "40 most significantly DE genes in the blockage-point comparison. logFC>0 indicates higher expression in the T-/- background"
+  )
+```
+
+## Identifying genes that are upregulated along somitic commitment
+
+Many genes are differentially expressed at the blockage.
+However, which of these are actually important in an NMP's commitment towards somitic mesoderm, and which are ...
+
+To identify the genes that change along normal progression of NMPs to somites, we now perform DE testing between the NMP and somite groups in the wild-type fraction only of the *T* chimaeras.
+Here, we do not use DPT as a covariate, as it is this progression that we are trying to assess.
+We also do not need to exclude genes using the WT chimaeras, as our comparison is restricted to the Tomato- fraction only.
+Otherwise, the DE testing is performed as above (i.e., using TREAT).
+The results from this test are shown in Figure \@ref(fig:do-de-somites).
+
+```{r do-de-somites,fig.wide = FALSE, fig.height=5, fig.cap = "Summary of DE results for the NMP-somite comparison. Genes coloured in red were significantly DE (BH-corrected p<0.1). A number of points are labelled, with an arbitrary threshold chosen on logFC. PSM abbreviates presomitic mesoderm"}
+
+#DE between Tom- somites and NMP
+sub_along = scater::normalize(sce[,match(sub_t_meta$cell[(sub_t_meta$dpt < somite.max &
+                                                           sub_t_meta$dpt > somite.min &
+                                                           !sub_t_meta$tomato) | 
+                                                            (sub_t_meta$dpt < bipot.max &
+                                                             sub_t_meta$dpt > bipot.min &
+                                                             !sub_t_meta$tomato)],
+                                          colnames(sce))])
+sub_along_meta = sub_t_meta[match(colnames(sub_along), sub_t_meta$cell),]
+
+sub_along_meta$group = sapply(sub_along_meta$cell, function(x){
+  if(!x %in% sub_t_meta$cell){
+    return("Other")
+  } else {
+    dpt = sub_t_meta$dpt[match(x, sub_t_meta$cell)]
+    if(dpt < cross.max & dpt > cross.min){
+      return("Tom+Tom-")
+    } else if(dpt < bipot.max & 
+              dpt > bipot.min &
+              !sub_t_meta$tomato[sub_t_meta$cell == x]){
+      return("NMP")
+    } else if(dpt < somite.max & 
+              dpt > somite.min &
+              !sub_t_meta$tomato[sub_t_meta$cell == x]){
+      return("Somite")
+    } else {
+    return("Other")
+  }
+}})
+
+# de_along = findMarkers(sub_along,#[calcAverage(sub_along) > 0.1,], 
+#                        clusters = sub_along_meta$group)
+
+de_along = de_no_dpt(
+  x = sub_along, 
+  clusters = sub_along_meta$group, 
+  pools = sub_along_meta$pool,
+  reference_cluster = "NMP",
+  lfc = 0.5
+  )
+de_along$FDR = p.adjust(de_along$PValue, method = "fdr")
+
+write.table(de_along, 
+  file = "/nfs/research1/marioni/jonny/chimera-t/scripts/nmp/de_out/tchim_tom-_nmp_somiticmeso.csv",
+  sep = ",",
+  col.names = TRUE, 
+  row.names = TRUE,
+  quote = FALSE)
+
+labs_along = de_along[de_along$logFC < -3 | de_along$logFC > 3,]
+labs_along$mgi = get_mgi(rownames(labs_along))
+
+ggplot(as.data.frame(de_along), aes(x = logFC, y = -log10(PValue), col = FDR < 0.1)) +
+  geom_point() +
+  scale_color_manual(values = c("TRUE" = "red", "FALSE" = "black")) +
+  labs(x = "log2FC(PSM/NMP)", y = "-log10(p)")  +
+  geom_label_repel(data = as.data.frame(labs_along), 
+                   mapping = aes(x = logFC, y = -log10(PValue),
+                                 label = mgi), inherit.aes = FALSE,
+                   min.segment.length = 0) +
+  ggtitle("DE along NMP-somitic development")
+
+
+```
+
+Clearly these cells are progressing from an NMP state to a mesodermal state.
+
+## The blockage point contains cells that have begin to commit towards the somitic mesoderm
+
+Although T-/- cells are accumulating at the blockage point described above, it is not immediately apparent that they have exited their bipotent NMP state.
+To test this, we perform differential expression testing between the bipotent NMP group and the developmental blockage group (see Figure \@ref(fig:de)), considering cells in the Tomato- fraction.
+The results of this are shown in \@ref(fig:check-progression) in the host fraction of the T chimeras.
+
+```{r check-progression, fig.height = 5, fig.wide = FALSE, fig.cap = "Summary of DE results for the NMP-cross background comparison. Genes coloured in red were significantly DE (BH-corrected p<0.1). A number of points are labelled, these are manually selected markers for NMP progression."}
+
+state = sapply(sub_t_meta$dpt, function(x){
+  if(x < cross.max & x > cross.min){
+    return("blockage")
+  } else if(x < bipot.max & x > bipot.min){
+  return("bipot")
+  } else {
+    return("other")
+  }
+})
+
+# de_prog = findMarkers(
+#   x = scater::normalize(s2[,!sub_t_meta$tomato & state != "other"]), 
+#   clusters = state[!sub_t_meta$tomato & state != "other"]
+#   )
+de_prog = de_no_dpt(
+  x = scater::normalize(s2[,!sub_t_meta$tomato & state != "other"]), 
+  clusters = state[!sub_t_meta$tomato & state != "other"], 
+  pools = sub_t_meta$pool[!sub_t_meta$tomato & state != "other"],
+  reference_cluster = "bipot",
+  lfc = 0.5
+  )
+de_prog$mgi = get_mgi(rownames(de_prog))
+
+write.table(de_prog, 
+  file = "/nfs/research1/marioni/jonny/chimera-t/scripts/nmp/de_out/tchim_tom-_nmp_blockage.csv",
+  sep = ",",
+  col.names = TRUE, 
+  row.names = TRUE,
+  quote = FALSE)
+
+labs_prog = de_prog[de_prog$mgi %in% c("Sox2", "Tbx6", "Cyp26a1", "Nkx1-2", "Rspo3"),]
+
+ggplot(as.data.frame(de_prog), 
+  aes(
+    x = logFC, 
+    y = -log10(PValue), 
+    col = FDR < 0.1)
+  ) +
+  geom_point() +
+  scale_color_manual(values = c("TRUE" = "red", "FALSE" = "black")) +
+  labs(x = "log2FC(Blockage/Bipotent), WT background", y = "-log10(p)")  +
+  geom_label_repel(data = as.data.frame(labs_prog), 
+                   mapping = aes(x = logFC, y = -log10(PValue),
+                                 label = mgi), inherit.aes = FALSE,
+                   min.segment.length = 0) +
+  ggtitle("Bipotent vs. blockage DE comparison,\nwild-type background, T chimaeras")
+
+
+```
+
+Certainly, the wild-type cells have begun somitic mesoderm commitment: they downregulate *Sox2* and *Nkx1-2*, and begin to upregulate presomitic mesodermal genes like *Tbx6*.
+Do the injected, T knockout cells show the same behaviour?
+Indeed, as shown in \@ref(fig:check-progression-ko), these cells behave similarly (although not identically, due to the *T* knockout) to the wild-type cells.
+
+```{r check-progression-ko, fig.height = 5, fig.wide = FALSE, fig.cap = "Summary of DE results for the NMP-cross background comparison. Genes coloured in red were significantly DE (BH-corrected p<0.1). A number of points are labelled, these are manually selected markers for NMP progression."}
+
+de_prog_t = de_no_dpt(
+  x = scater::normalize(s2[,sub_t_meta$tomato & state != "other"]), 
+  clusters = state[sub_t_meta$tomato & state != "other"], 
+  pools = sub_t_meta$pool[sub_t_meta$tomato & state != "other"],
+  reference_cluster = "bipot",
+  lfc = 0.5
+  )
+de_prog_t$mgi = get_mgi(rownames(de_prog_t))
+
+write.table(de_prog_t, 
+  file = "/nfs/research1/marioni/jonny/chimera-t/scripts/nmp/de_out/tchim_tom+_nmp_blockage.csv",
+  sep = ",",
+  col.names = TRUE, 
+  row.names = TRUE,
+  quote = FALSE)
+
+
+# labs_prog = dedf[dedf$logFC.bipot < -0.5 | dedf$logFC.bipot > 0.6,]
+labs_prog = de_prog_t[de_prog_t$mgi %in% c("Sox2", "Tbx6", "Cyp26a1", "Nkx1-2", "Rspo3"),]
+
+
+
+ggplot(as.data.frame(de_prog_t), 
+  aes(
+    x = logFC, 
+    y = -log10(PValue), 
+    col = FDR < 0.1)
+  ) +
+  geom_point() +
+  scale_color_manual(values = c("TRUE" = "red", "FALSE" = "black")) +
+  labs(x = "log2FC(Blockage/Bipotent), T-/- background", y = "-log10(p)")  +
+  geom_label_repel(data = as.data.frame(labs_prog), 
+                   mapping = aes(x = logFC, y = -log10(PValue),
+                                 label = mgi), inherit.aes = FALSE,
+                   min.segment.length = 0) +
+  ggtitle("Bipotent vs. blockage DE comparison,\nT knockout background, T chimaeras")
+
+
+```
+
+The 40 genes that were most significantly DE in the wild-type comparison are shown in Table \@ref(tab:de-tab-prog).
+
+```{r de-tab-prog}
+top = de_prog[order(de_prog$FDR),][1:40, c("mgi", "logFC", "FDR")]
+names(top) = c("mgi", "logFC.host", "FDR.host")
+top$logFC.injected = de_prog_t[rownames(top), "logFC"]
+top$FDR.injected = de_prog_t[rownames(top), "FDR"]
+kable(top, caption = "Most significantly DE genes in the Bipotent-blockage comparison")
+```
+
+## Combining DE results between the blockage and somitic development
+
+Results from both of the comparisons described above are shown together in Figure \@ref(fig:plot-de-both).
+Genes along the diagonals are the candidate disregulated genes: they are the genes that are DE along NMP-somite development that are also diregulated in the T-knockout background.
+
+```{r plot-de-both,fig.wide = TRUE, fig.height=8, fig.cap = "Summary of DE results. Genes coloured in red were significantly DE in both comparisons (BH-corrected p<0.1). A number of points are labelled, these are the genes with largest distance to the origin. PSM abbreviates presomitic mesoderm"}
+
+#get the DE genes
+hits_along = de_along[de_along$FDR < 0.1,]
+hits_between = de_between[de_between$FDR < 0.1,]
+intersect = rownames(hits_along)[rownames(hits_along) %in% rownames(hits_between)]
+hits = data.frame(gene = intersect,
+                  mgi = get_mgi(intersect),
+                  logFC.tomplus.tomneg = hits_between$logFC[match(intersect, rownames(hits_between))],
+                  fdr.tomplus.tomneg = hits_between$FDR[match(intersect, rownames(hits_between))],
+                  logFC.somites.nmp = hits_along$logFC[match(intersect, rownames(hits_along))],
+                  fdr.somites.nmp = hits_along$FDR[match(intersect, rownames(hits_along))]
+                  )
+
+#get all genes
+rn = rownames(de_along)
+all = data.frame(gene = rn,
+                  mgi = genes[match(rn, genes[,1]),2],
+                  logFC.tomplus.tomneg = de_between$logFC[match(rn, rownames(de_between))],
+                  fdr.tomplus.tomneg = de_between$FDR[match(rn, rownames(de_between))],
+                  logFC.somites.nmp = de_along$logFC[match(rn, rownames(de_along))],
+                  fdr.somites.nmp = de_along$FDR[match(rn, rownames(de_along))]
+                  )
+
+#no longer necessary as these were removed in the de_between
+# #remove the WT-DE genes
+# hits = hits[-which(hits$gene %in% agree_ensembl),]
+# all = all[-which(all$gene %in% agree_ensembl),]
+
+hits$dist = sqrt(hits$logFC.tomplus.tomneg^2 + hits$logFC.somites.nmp^2)
+labels = hits[hits$dist > quantile(hits$dist, 0),]
+
+p = ggplot(all, aes(x = logFC.tomplus.tomneg, 
+                y = logFC.somites.nmp, 
+                col = gene %in% hits$gene,
+                alpha = gene %in% hits$gene)) +
+  geom_point(data = all[!all$gene %in% hits$gene,], size = 0.8) +
+  geom_point(data = all[all$gene %in% hits$gene,], pch = 21, fill = "red", col = "black", size = 2) +
+  geom_hline(yintercept = 0) + geom_vline(xintercept = 0) +
+  scale_color_manual(name = "", values = c("TRUE" = "red", "FALSE" = "black"),
+                     labels = c("TRUE" = "DE in both", "FALSE" = "Not DE in both")) +
+  scale_alpha_manual(name = "", values = c("TRUE" = 1, "FALSE" = 0.2),
+                     labels = c("TRUE" = "DE in both", "FALSE" = "Not DE in both")) +
+  geom_label_repel(data = labels, mapping = aes(x = logFC.tomplus.tomneg, 
+                                                y = logFC.somites.nmp,
+                                                label = mgi), inherit.aes = FALSE,
+                   min.segment.length = 0) +
+  labs(x = "log2FC(Tom+/Tom-), blockage", y = "log2FC(PSM/NMP), Tom-") +
+  theme(legend.position = "none") +
+  annotate(geom = "label", x = -4, y = -4.5, label = sprintf("NMP to PSM down\nTom+ down vs. Tom-"), alpha = 0.5, fill = "darkgrey") +
+  annotate(geom = "label", x = 4, y = -4.5, label = sprintf("NMP to PSM down\nTom+ up vs. Tom-"), alpha = 0.5, fill = "darkgrey") +
+  annotate(geom = "label", x = -4, y = 4.5, label = sprintf("NMP to PSM up\nTom+ down vs. Tom-"), alpha = 0.5, fill = "darkgrey") +
+  annotate(geom = "label", x = 4, y = 4.5, label = sprintf("NMP to PSM up\nTom+ up vs. Tom-"), alpha = 0.5, fill = "darkgrey") +
+  coord_cartesian(xlim = c(-5, 5), ylim = c(-5, 5))
+
+p
+
+ggsave(p, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/nmp/plots/de_both.pdf",
+       width = 6, height = 6)
+
+write.table(hits, 
+  file = "/nfs/research1/marioni/jonny/chimera-t/scripts/nmp/de_out/intersect__tchim_tom+_tom-_blockage__tchim_tom-_nmp_somiticmeso.csv",
+  sep = ",", quote = FALSE, row.names = FALSE, col.names = TRUE)
+
+```
+
+There are `r sum(hits$logFC.tomplus.tomneg > 0 & hits$logFC.somites.nmp > 0)` DE genes in the top-right quadrant,
+`r sum(hits$logFC.tomplus.tomneg < 0 & hits$logFC.somites.nmp > 0)` DE genes in the top-left quadrant,
+`r sum(hits$logFC.tomplus.tomneg < 0 & hits$logFC.somites.nmp < 0)` DE genes in the bottom-left quadrant,
+and `r sum(hits$logFC.tomplus.tomneg > 0 & hits$logFC.somites.nmp < 0)` DE genes in the bottom-right quadrant.
+
+We now explore a few of these genes' expression in the UMAP.
+
+```{r plot-expr, fig.wide = TRUE, fig.height = 16, fig.cap = "Gene expression for particular DE genes."}
+
+
+gene_list = c("T", "Tbx6", "Fgf8", "Rspo3", "Fgf3", "Dll1", "Epha5", "Id2")
+plots = lapply(gene_list, plot_expr_split)
+
+grid = plot_grid(plotlist = plots, ncol = 2)
+grid
+
+
+```
+
+## Highlighting specific genes
+
+Next, the two-axis DE result is shown highlighting several manually selected genes with known critical roles for this NMP-somite process of development.
+
+```{r plot-de-selected,fig.wide = TRUE, fig.height=8, fig.cap = "Summary of DE results. Genes coloured in red were significantly DE in both comparisons (BH-corrected p<0.1). A number of points are labelled, these were manually selected. PSM abbreviates presomitic mesoderm"}
+
+labels = all[all$mgi %in% c(
+  "Rspo3",
+  "Dll1",
+  "Hes3",
+  "Sox2",
+  "T",
+  "Tbx6",
+  "Rspo3",
+  "Cyp26a1",
+  "Nkx1-2",
+  "Fgf8",
+  "Fgf3",
+  "Id2",
+  "Epha5",
+  "Cd24a",
+  "Crabp1",
+  "Col26a1"
+  ),]
+
+# labels = all[grepl("Fgf", all$mgi) & (all$fdr.tomplus.tomneg < 0.1 | all$fdr.somites.nmp < 0.1),]
+
+
+p = ggplot(all, aes(x = logFC.tomplus.tomneg, 
+                y = logFC.somites.nmp, 
+                col = gene %in% hits$gene,
+                alpha = gene %in% hits$gene)) +
+  geom_point(data = all[!all$gene %in% hits$gene,], size = 0.8) +
+  geom_point(data = all[all$gene %in% hits$gene,], pch = 21, fill = "red", col = "black", size = 2) +
+  geom_hline(yintercept = 0) + geom_vline(xintercept = 0) +
+  scale_color_manual(name = "", values = c("TRUE" = "red", "FALSE" = "black"),
+                     labels = c("TRUE" = "DE in both", "FALSE" = "Not DE in both")) +
+  scale_alpha_manual(name = "", values = c("TRUE" = 1, "FALSE" = 0.2),
+                     labels = c("TRUE" = "DE in both", "FALSE" = "Not DE in both")) +
+  geom_label_repel(data = labels, mapping = aes(x = logFC.tomplus.tomneg, 
+                                                y = logFC.somites.nmp,
+                                                label = mgi), inherit.aes = FALSE,
+  min.segment.length=0,
+  alpha = 1) +
+  labs(x = "log2FC(Tom+/Tom-), blockage", y = "log2FC(PSM/NMP), Tom-") +
+  theme(legend.position = "none") +
+  annotate(geom = "label", x = -4, y = -4.5, label = "NMP to PSM down\nTom+ down vs. Tom-", alpha = 0.5, fill = "darkgrey") +
+  annotate(geom = "label", x = 4, y = -4.5, label = "NMP to PSM down\nTom+ up vs. Tom-", alpha = 0.5, fill = "darkgrey") +
+  annotate(geom = "label", x = -4, y = 4.5, label = "NMP to PSM up\nTom+ down vs. Tom-", alpha = 0.5, fill = "darkgrey") +
+  annotate(geom = "label", x = 4, y = 4.5, label = "NMP to PSM up\nTom+ up vs. Tom-", alpha = 0.5, fill = "darkgrey") +
+  coord_cartesian(xlim = c(-5, 5), ylim = c(-5, 5)) +
+  ggtitle("Selected genes")
+
+p
+
+ggsave(p, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/nmp/plots/de_both_selected.pdf",
+       width = 8, height = 6)
+
+```
+
+```{r plot-de-signalling,fig.wide = TRUE, fig.height=8, fig.cap = "Summary of DE results. Genes coloured in red were significantly DE in both comparisons (BH-corrected p<0.1). A number of points are labelled, these were manually selected. PSM abbreviates presomitic mesoderm"}
+
+labels = all[all$mgi %in% c(
+  "Fgf8",
+  "Fgf3",
+  "Fgf4",
+  "Fgf15",
+  "Rspo3",
+  "Wnt3a",
+  "Wnt6",
+  "Dll1",
+  "Fzd10"
+  ),]
+
+# labels = all[grepl("Fgf", all$mgi) & (all$fdr.tomplus.tomneg < 0.1 | all$fdr.somites.nmp < 0.1),]
+
+
+p = ggplot(all, aes(x = logFC.tomplus.tomneg, 
+                y = logFC.somites.nmp, 
+                col = gene %in% hits$gene,
+                alpha = gene %in% hits$gene)) +
+  geom_point(data = all[!all$gene %in% hits$gene,], size = 0.8) +
+  geom_point(data = all[all$gene %in% hits$gene,], pch = 21, fill = "red", col = "black", size = 2) +
+  geom_hline(yintercept = 0) + geom_vline(xintercept = 0) +
+  scale_color_manual(name = "", values = c("TRUE" = "red", "FALSE" = "black"),
+                     labels = c("TRUE" = "DE in both", "FALSE" = "Not DE in both")) +
+  scale_alpha_manual(name = "", values = c("TRUE" = 1, "FALSE" = 0.2),
+                     labels = c("TRUE" = "DE in both", "FALSE" = "Not DE in both")) +
+  geom_label_repel(data = labels, mapping = aes(x = logFC.tomplus.tomneg, 
+                                                y = logFC.somites.nmp,
+                                                label = mgi), inherit.aes = FALSE,
+  min.segment.length=0,
+  alpha = 1) +
+  labs(x = "log2FC(Tom+/Tom-), blockage", y = "log2FC(PSM/NMP), Tom-") +
+  theme(legend.position = "none") +
+  annotate(geom = "label", x = -4, y = -4.5, label = sprintf("NMP to PSM down\nTom+ down vs. Tom-"), alpha = 0.5, fill = "darkgrey") +
+  annotate(geom = "label", x = 4, y = -4.5, label = sprintf("NMP to PSM down\nTom+ up vs. Tom-"), alpha = 0.5, fill = "darkgrey") +
+  annotate(geom = "label", x = -4, y = 4.5, label = sprintf("NMP to PSM up\nTom+ down vs. Tom-"), alpha = 0.5, fill = "darkgrey") +
+  annotate(geom = "label", x = 4, y = 4.5, label = sprintf("NMP to PSM up\nTom+ up vs. Tom-"), alpha = 0.5, fill = "darkgrey") +
+  coord_cartesian(xlim = c(-5, 5), ylim = c(-5, 5)) +
+  ggtitle("DE signalling molecules")
+
+p
+
+ggsave(p, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/nmp/plots/de_both_signalling.pdf",
+       width = 8, height = 6)
+
+wnt_grid = plot_grid(
+  p,
+  plot_expr_split("Rspo3") + theme(plot.title = element_blank()),
+  plot_expr_split("Wnt6") + theme(plot.title = element_blank()),
+  ncol = 1,#,
+  rel_heights = c(0.4, 0.2, 0.2),
+  labels = "auto"
+  )
+
+save_plot(wnt_grid, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/nmp/plots/wnt_grid.pdf",
+       base_width = 8, base_height = 12)
+
+```
+
+```{r plot-de-fgf,fig.wide = TRUE, fig.height=8, fig.cap = "Summary of DE results. Genes coloured in red were significantly DE in both comparisons (BH-corrected p<0.1). Labelled points are Fgf genes that were significantly DE in at least one comparison. PSM abbreviates presomitic mesoderm."}
+
+
+labels = all[grepl("Fgf", all$mgi) & (all$fdr.tomplus.tomneg < 0.1 | all$fdr.somites.nmp < 0.1),]
+
+
+p = ggplot(all, aes(x = logFC.tomplus.tomneg, 
+                y = logFC.somites.nmp, 
+                col = gene %in% hits$gene,
+                alpha = gene %in% hits$gene)) +
+  geom_point(data = all[!all$gene %in% hits$gene,], size = 0.8) +
+  geom_point(data = all[all$gene %in% hits$gene,], pch = 21, fill = "red", col = "black", size = 2) +
+  geom_hline(yintercept = 0) + geom_vline(xintercept = 0) +
+  scale_color_manual(name = "", values = c("TRUE" = "red", "FALSE" = "black"),
+                     labels = c("TRUE" = "DE in both", "FALSE" = "Not DE in both")) +
+  scale_alpha_manual(name = "", values = c("TRUE" = 1, "FALSE" = 0.2),
+                     labels = c("TRUE" = "DE in both", "FALSE" = "Not DE in both")) +
+  geom_label_repel(data = labels, mapping = aes(x = logFC.tomplus.tomneg, 
+                                                y = logFC.somites.nmp,
+                                                label = mgi), inherit.aes = FALSE,
+  min.segment.length=0) +
+  labs(x = "log2FC(Tom+/Tom-), blockage", y = "log2FC(PSM/NMP), Tom-") +
+  theme(legend.position = "none") +
+  annotate(geom = "label", x = -4, y = -4.5, label = sprintf("NMP to PSM down\nTom+ down vs. Tom-"), alpha = 0.5, fill = "darkgrey") +
+  annotate(geom = "label", x = 4, y = -4.5, label = sprintf("NMP to PSM down\nTom+ up vs. Tom-"), alpha = 0.5, fill = "darkgrey") +
+  annotate(geom = "label", x = -4, y = 4.5, label = sprintf("NMP to PSM up\nTom+ down vs. Tom-"), alpha = 0.5, fill = "darkgrey") +
+  annotate(geom = "label", x = 4, y = 4.5, label = sprintf("NMP to PSM up\nTom+ up vs. Tom-"), alpha = 0.5, fill = "darkgrey") +
+  coord_cartesian(xlim = c(-5, 5), ylim = c(-5, 5)) +
+  ggtitle("DE Fgfs")
+
+p
+
+```
+
+```{r plot-de-wnt,fig.wide = TRUE, fig.height=8, fig.cap = "Summary of DE results. Genes coloured in red were significantly DE in both comparisons (BH-corrected p<0.1). Labelled points are Wnt genes that were significantly DE in at least one comparison. PSM abbreviates presomitic mesoderm."}
+
+
+labels = all[grepl("Wnt|Fzd|Rspo3", all$mgi) & (all$fdr.tomplus.tomneg < 0.1 | all$fdr.somites.nmp < 0.1),]
+
+
+p = ggplot(all, aes(x = logFC.tomplus.tomneg, 
+                y = logFC.somites.nmp, 
+                col = gene %in% hits$gene,
+                alpha = gene %in% hits$gene)) +
+  geom_point(data = all[!all$gene %in% hits$gene,], size = 0.8) +
+  geom_point(data = all[all$gene %in% hits$gene,], pch = 21, fill = "red", col = "black", size = 2) +
+  geom_hline(yintercept = 0) + geom_vline(xintercept = 0) +
+  scale_color_manual(name = "", values = c("TRUE" = "red", "FALSE" = "black"),
+                     labels = c("TRUE" = "DE in both", "FALSE" = "Not DE in both")) +
+  scale_alpha_manual(name = "", values = c("TRUE" = 1, "FALSE" = 0.2),
+                     labels = c("TRUE" = "DE in both", "FALSE" = "Not DE in both")) +
+  geom_label_repel(data = labels, mapping = aes(x = logFC.tomplus.tomneg, 
+                                                y = logFC.somites.nmp,
+                                                label = mgi), inherit.aes = FALSE,
+  min.segment.length=0) +
+  labs(x = "log2FC(Tom+/Tom-), blockage", y = "log2FC(PSM/NMP), Tom-") +
+  theme(legend.position = "none") +
+  annotate(geom = "label", x = -1, y = -4, label = "Up in PSM, down in Tom+", alpha = 0.5, fill = "darkgrey") +
+  annotate(geom = "label", x = 0.5, y = -4, label = "Up in PSM,\nup in Tom+", alpha = 0.5, fill = "darkgrey") +
+  annotate(geom = "label", x = -1.5, y = 2.5, label = "Up in NMP, down in Tom+", alpha = 0.5, fill = "darkgrey") +
+  annotate(geom = "label", x = 0.5, y = 2.5, label = "Up in NMP,\nup in Tom+", alpha = 0.5, fill = "darkgrey") +
+  coord_cartesian(xlim = c(-5, 5), ylim = c(-5, 5)) +
+  ggtitle("All Wnts")
+
+p
+
+```
+
+# Identifying disregulation in the bipotent NMP cells
+
+Now, we ask if the bipotent NMP group was already showing DE between the Tomato+ and Tomato- backgrounds prior to the commitment towards the mesodermal lineage.
+
+```{r de-nmp, fig.height = 5, fig.wide = FALSE, fig.cap = "Summary of DE results for the bipotent NMP comparison across genetic backgrounds. Genes coloured in red were significantly DE (BH-corrected p<0.1). A number of points are labelled, these were the genes with largest fold-changes."}
+
+
+state_wt = sapply(sub_wt_meta$dpt, function(x){
+  if(x < cross.max & x > cross.min){
+    return("blockage")
+  } else if(x < bipot.max & x > bipot.min){
+  return("bipot")
+  } else {
+    return("other")
+  }
+})
+
+
+de_bipot = getTrimmedDE(
+  t_sce = scater::normalize(s2[,state == "bipot"]),
+  t_clusters = sub_t_meta$tomato[state == "bipot"],
+  t_pools = sub_t_meta$pool[state == "bipot"],
+  t_dpt = sub_t_meta$dpt[state == "bipot"],
+  wt_sce = scater::normalize(s3[,state_wt == "bipot"]),
+  wt_clusters = sub_wt_meta$tomato[state_wt == "bipot"],
+  wt_pools = sub_wt_meta$pool[state_wt == "bipot"],
+  wt_dpt = sub_wt_meta$dpt[state_wt == "bipot"],
+  lfc = 0.5
+  )
+
+write.table(de_bipot, 
+  file = "/nfs/research1/marioni/jonny/chimera-t/scripts/nmp/de_out/tchim_tom+nmp_tom-nmp.csv",
+  sep = ",",
+  col.names = TRUE, 
+  row.names = TRUE,
+  quote = FALSE)
+
+
+labs_bipot = de_bipot[de_bipot$logFC < -1 | de_bipot$logFC > 1,]
+
+
+ggplot(as.data.frame(de_bipot), 
+  aes(
+    x = logFC, 
+    y = -log10(PValue), 
+    col = FDR < 0.1)
+  ) +
+  geom_point() +
+  scale_color_manual(values = c("TRUE" = "red", "FALSE" = "black")) +
+  labs(x = "log2FC(Tom+/Tom-), Bipotent NMP", y = "-log10(p)")  +
+  geom_label_repel(data = as.data.frame(labs_bipot), 
+                   mapping = aes(x = logFC, y = -log10(PValue),
+                                 label = mgi), inherit.aes = FALSE,
+                   min.segment.length = 0) +
+  ggtitle("Across background, bipotent NMPs")
+
+```
+
+# Identifying disregulation in the somitic mesoderm
+
+A few Tomato+ cells do actually pake it through the apparent point of blockage, towards the somitic mesoderm proper.
+We consider these cells as those that mapped to the *Somitic mesoderm* celltype.
+However, they are few (`r sum(meta$celltype.mapped == "Somitic mesoderm" & meta$tomato)`) compared to those of the Tomato- background (`r sum(meta$celltype.mapped == "Somitic mesoderm" & !meta$tomato)`).
+Nevertheless, even though these Tomato+ cells are on the whole like the somitic mesoderm, what differences do they show compared to the relatively "normal" Tomato- somitic mesoderm?
+The DE results (excluding genes that are DE in the matched wild-type comparison) are shown in Figure \@ref(fig:de-somitic).
+
+```{r de-somitic, fig.cap = "Summary of DE results for the somitic mesoderm, across genetic backgrounds. Genes coloured in red were significantly DE (BH-corrected p<0.1). A number of points are labelled, these were the genes with largest fold-changes."}
+
+de_som = getTrimmedDE(
+  t_sce = scater::normalize(s2[, sub_t_meta$celltype.mapped == "Somitic mesoderm"]) , 
+  t_clusters = sub_t_meta$tomato[sub_t_meta$celltype.mapped == "Somitic mesoderm"], 
+  t_pools = sub_t_meta$pool[sub_t_meta$celltype.mapped == "Somitic mesoderm"], 
+  t_dpt = sub_t_meta$dpt[sub_t_meta$celltype.mapped == "Somitic mesoderm"],
+  wt_sce = scater::normalize(s3[, sub_wt_meta$celltype.mapped == "Somitic mesoderm"]) , 
+  wt_clusters = sub_wt_meta$tomato[sub_wt_meta$celltype.mapped == "Somitic mesoderm"], 
+  wt_pools = sub_wt_meta$pool[sub_wt_meta$celltype.mapped == "Somitic mesoderm"], 
+  wt_dpt = sub_wt_meta$dpt[sub_wt_meta$celltype.mapped == "Somitic mesoderm"], 
+  lfc = 0.5
+  )
+
+write.table(de_som, 
+  file = "/nfs/research1/marioni/jonny/chimera-t/scripts/nmp/de_out/tchim_tom+somiticmeso_tom-somiticmeso.csv",
+  sep = ",",
+  col.names = TRUE, 
+  row.names = TRUE,
+  quote = FALSE)
+
+hits_t_som = de_som[de_som$FDR < 0.1,]
+labs_t = hits_t_som[
+  hits_t_som$logFC < quantile(hits_t_som$logFC, 0.03) |
+  hits_t_som$logFC > quantile(hits_t_som$logFC, 0.97),
+  ]
+
+
+ggplot(mapping = aes(x = logFC, y = -log10(PValue))) +
+  geom_point(
+    data = de_som,
+    mapping = aes(col = FDR < 0.1)) +
+  geom_label_repel(
+    data = labs_t,
+    mapping = aes(label = mgi)
+    ) +
+  scale_color_manual(values = c("TRUE" = "red", "FALSE" = "black")) +
+  theme(legend.position = "none")
+
+hits_t_som$same_de_at_blockage = sapply(rownames(hits_t_som), function(x){
+  if(x %in% rownames(hits_between)){
+    if(sign(hits_between[x,"logFC"]) == sign(hits_t_som[x,"logFC"])){
+      return(TRUE)
+    } else {
+      return(FALSE)
+    }
+  } else {
+    return(FALSE)
+  }
+})
+
+# write.table(hits_t_som, file = "/nfs/research1/marioni/jonny/chimera-t/scripts/nmp/de_out/matched_tchim_tom+somiticmeso_tom-somiticmeso.csv")
+
+
+
+```
+
+# Compensation at the blockage point
+
+We have so far considered comparisons in the *T* chimera. 
+However, it is possible that the wild-type cells in the chimera are behaving differently due to the presence of the *T*-/- injected cells.
+Here, we perform a differential expression test between the host cells in the *T* and WT chimeras.
+We note that this comparison is confounded by experiment (i.e., there may exist technical effects in the comparison) but that it should be largely effective for genes with large logFCs.
+
+
+```{r}
+colnames(sub_between) = paste0("T_", colnames(sub_between))
+colnames(sub_between_wt) = paste0("WT_", colnames(sub_between_wt))
+host = scater::normalize(
+  cbind(
+    sub_between[, !sub_between_meta$tomato], 
+    sub_between_wt[, !sub_between_meta_wt$tomato]
+    )
+  )
+host_meta = data.frame(
+  cell = c(
+    colnames(sub_between)[!sub_between_meta$tomato], 
+    colnames(sub_between_wt)[!sub_between_meta_wt$tomato]),
+  sample = c(
+    paste0("T_", sub_between_meta$sample[!sub_between_meta$tomato]),
+    paste0("WT_", sub_between_meta_wt$sample[!sub_between_meta_wt$tomato])
+    ),
+  experiment = c(
+    rep("T", nrow(sub_between_meta[!sub_between_meta$tomato, ])),
+    rep("WT", nrow(sub_between_meta_wt[!sub_between_meta_wt$tomato, ]))
+    )
+  )
+
+dge = DGEList(counts = counts(host), norm.factors = sizeFactors(host), genes = rownames(host))
+mm = model.matrix( ~ experiment == "T", data = host_meta)
+# mm = model.matrix( ~ 0 + factor(sample) + factor(experiment), data = host_meta)
+
+dge = estimateDisp(dge, design = mm)
+fit = glmQLFit(dge, design = mm)
+test = glmTreat(fit, lfc = 0.5)
+
+#remove genes that are not actually present in the expr mat
+#they give NA pvalues
+test$table = test$table[!is.na(test$table$PValue),]
+test$table$FDR = p.adjust(test$table$PValue, method = "fdr")
+de_comp = test$table
+de_comp$mgi = genes[match(rownames(de_comp), genes[,1]),2]
+
+ggplot(as.data.frame(de_comp), aes(x = logFC, y = -log10(PValue), col = FDR < 0.1)) +
+  geom_point() +
+  scale_color_manual(values = c("TRUE" = "red", "FALSE" = "black")) +
+  labs(x = "log2FC(T chimera/WT chimera)", y = "-log10(p)")  +
+  ggtitle("Blockage point DE, WT background\nacross chimeras")
+
+write.table(de_comp, 
+  file = "/nfs/research1/marioni/jonny/chimera-t/scripts/nmp/de_out/tchim_tom-blockage_wtchim_tom-blockage.csv",
+  sep = ",",
+  col.names = TRUE, 
+  row.names = TRUE,
+  quote = FALSE)
+```
+
+The DE genes are listed below, in Table \@ref(tab:de-comp-tab).
+These results may be mostly technical (e.g. the *Hbb* signal).
+
+```{r de-comp-tab}
+de_comp = de_comp[order(de_comp$FDR),]
+kable(de_comp[de_comp$FDR < 0.1, c("mgi", "logFC", "FDR")],
+  caption = "Blockage point DE significant genes in host backgrounds. logFC < 0 means higher expression in the WT chimera host cells"
+  )
+```
+
+A number of the signalling-associated genes that were downregulated in the blockage point in the *T*-/- cells are upregulated in the host cells of the *T*-/- chimera.
+However, the effect is not universal to all such genes, and the fold-changes are small.
+The results for a subset of genes are shown in Table \@ref(tab:de-blockage-comp)
+
+```{r de-blockage-comp}
+
+cool_genes = c("Cyp26a1", "Rspo3", "Fgf3", "Fgf4", "T", "Fgf8", "Dll1")
+
+kable(de_comp[de_comp$mgi %in% cool_genes, c("mgi", "logFC", "PValue")],
+  caption = "logFC < 0 means higher expression in the WT chimera host cells")
+
+```
+
+# Identifying disregulation in the intermediate mesoderm
+
+Similarly to the somitic mesoderm, there are some intermediate mesoderm cells in the Tomato+ background of the T chimaera.
+Again, they are few (`r sum(meta$celltype.mapped == "Intermediate mesoderm" & meta$tomato)`) compared to those of the Tomato- background (`r sum(meta$celltype.mapped == "Intermediate mesoderm" & !meta$tomato)`).
+The DE results (excluding genes that are DE in the matched wild-type comparison) are shown in Figure \@ref(fig:de-intermediate).
+
+```{r de-intermediate, fig.cap = "Summary of DE results for the somitic mesoderm, across genetic backgrounds. Genes coloured in red were significantly DE (BH-corrected p<0.1). A number of points are labelled, these were the genes with largest fold-changes."}
+
+de_int = getTrimmedDE(
+  t_sce = scater::normalize(sce[, meta$celltype.mapped == "Intermediate mesoderm"]) , 
+  t_clusters = meta$tomato[meta$celltype.mapped == "Intermediate mesoderm"], 
+  t_pools = meta$pool[meta$celltype.mapped == "Intermediate mesoderm"], 
+  wt_sce = scater::normalize(wt_sce[, wt_meta$celltype.mapped == "Intermediate mesoderm"]) , 
+  wt_clusters = wt_meta$tomato[wt_meta$celltype.mapped == "Intermediate mesoderm"], 
+  wt_pools = wt_meta$pool[wt_meta$celltype.mapped == "Intermediate mesoderm"], 
+  lfc = 0.5,
+  dpt=FALSE
+  )
+
+write.table(de_int, 
+  file = "/nfs/research1/marioni/jonny/chimera-t/scripts/nmp/de_out/tchim_tom+intermeso_tom-intermeso.csv",
+  sep = ",",
+  col.names = TRUE, 
+  row.names = TRUE,
+  quote = FALSE)
+
+hits_t_int = de_int[de_int$FDR < 0.1,]
+labs_t = hits_t_int[
+  hits_t_int$logFC < quantile(hits_t_int$logFC, 0.05) |
+  hits_t_int$logFC > quantile(hits_t_int$logFC, 0.95),
+  ]
+
+
+ggplot(mapping = aes(x = logFC, y = -log10(PValue))) +
+  geom_point(
+    data = de_int,
+    mapping = aes(col = FDR < 0.1)) +
+  geom_label_repel(
+    data = labs_t,
+    mapping = aes(label = mgi)
+    ) +
+  scale_color_manual(values = c("TRUE" = "red", "FALSE" = "black")) +
+  theme(legend.position = "none")
+
+hits_t_int$same_de_at_blockage = sapply(rownames(hits_t_int), function(x){
+  if(x %in% rownames(hits_between)){
+    if(sign(hits_between[x,"logFC"]) == sign(hits_t_int[x,"logFC"])){
+      return(TRUE)
+    } else {
+      return(FALSE)
+    }
+  } else {
+    return(FALSE)
+  }
+})
+
+```
+
+Only `r sum(hits_t_int$same_de_at_blockage)` genes show the same differential expression direction and comparable significance in both the blockage point and in the intermediate mesoderm.
+These are `r paste(hits_t_int$mgi[hits_t_int$same_de_at_blockage], collapse = ", ")`.
+
+# Session Info
+```{r sessinf}
+sessionInfo()
+```
+
